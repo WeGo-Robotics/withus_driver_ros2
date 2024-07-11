@@ -24,7 +24,7 @@ class VelControlApp(QWidget):
         self.steering_label = QLabel('Steering Angle: 0', self)
 
         self.vel_slider = QSlider(Qt.Horizontal, self)
-        self.vel_slider.setRange(0, 70)
+        self.vel_slider.setRange(-70, 70)
         self.vel_slider.setValue(0)
         self.vel_slider.valueChanged.connect(self.update_vel_label)
 
