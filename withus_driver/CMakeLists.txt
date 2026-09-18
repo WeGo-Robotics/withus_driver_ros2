@@ -19,6 +19,18 @@ target_include_directories(withus_can_transport PUBLIC
   $<INSTALL_INTERFACE:include/${PROJECT_NAME}>
 )
 
+add_executable(can_connection_check
+  src/can_connection_check.cpp
+)
+
+target_link_libraries(can_connection_check PRIVATE
+  withus_can_transport
+)
+
+install(TARGETS can_connection_check
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(DIRECTORY include/
   DESTINATION include/${PROJECT_NAME}
 )
