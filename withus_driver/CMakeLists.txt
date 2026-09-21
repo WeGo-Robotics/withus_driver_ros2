@@ -10,6 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(Threads REQUIRED)
+find_package(withus_msgs REQUIRED)
 
 add_library(withus_can_transport SHARED
   src/socket_can_transport.cpp
@@ -47,6 +48,10 @@ target_link_libraries(withus_driver_node PRIVATE
   withus_can_transport
   withus_protocol
   Threads::Threads
+)
+
+ament_target_dependencies(withus_driver_node PUBLIC
+  withus_msgs
 )
 
 target_link_libraries(can_connection_check PRIVATE
