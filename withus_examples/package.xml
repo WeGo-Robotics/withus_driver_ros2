@@ -3,7 +3,7 @@
 <package format="3">
   <name>withus_examples</name>
   <version>0.0.0</version>
-  <description>Python examples for consuming Withus ROS 2 vehicle feedback.</description>
+  <description>Withus ROS 2 status monitoring and stationary brake response examples.</description>
   <maintainer email="chanmgin@wego-robotics.com">wego</maintainer>
   <license>TODO: License declaration</license>
 

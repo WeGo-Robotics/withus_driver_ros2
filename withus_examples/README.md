@@ -1,6 +1,6 @@
 # Withus Python 예제
 
-`withus_examples`는 공개 ROS 인터페이스로 차량 상태를 읽는 Python 예제 패키지입니다. `status_monitor`는 `withus_msgs/msg/VehicleStatus`를 구독하여 주요 값을 요약하고 수신 중단을 감지합니다.
+`withus_examples`는 공개 ROS 인터페이스를 사용하는 Python 예제 패키지입니다. `status_monitor`는 차량 상태 요약과 수신 중단 감시를 제공하고, `brake_response_check`는 명시적으로 요청한 정지 상태 제동 시험과 압력 관측을 수행합니다.
 
 ## 빌드
 
@@ -32,6 +32,31 @@ ros2 run withus_examples status_monitor
 ```
 
 예제 노드는 `/withus/status_monitor`, 구독 토픽은 `/withus/vehicle_status`입니다. 예제는 차량 명령을 보내지 않으며, Ctrl+C로 종료해도 드라이버는 계속 실행됩니다.
+
+## 정지 상태 제동 응답 예제
+
+차량을 정지·중립(N)으로 유지하고 기존 드라이버를 종료한 뒤 실행합니다. 시험 중 제동력이 달라질 수 있으므로 차량이 굴러가지 않게 유지하세요.
+
+```bash
+ros2 launch withus_bringup withus_brake_test.launch.py
+```
+
+A를 선택하고 다른 터미널에서 요청 비율과 시간을 지정합니다.
+
+```bash
+source install/setup.bash
+ros2 run withus_examples brake_response_check --brake-percent 10 --duration 1.0
+```
+
+`10`은 명령 사용 예시이며 검증된 정지 비율이 아닙니다. `--brake-percent`는 필수(0~100), `--duration`은 기본 1초이며 0 초과 1.5초 이하입니다. `--namespace` 기본값은 `/withus`입니다.
+
+예제는 준비 상태를 최대 5초 기다린 뒤 `/withus/brake_test_command`에 현재 세션·시각·제동 비율을 20ms마다 발행합니다. 드라이버 프로필이 다르거나 준비되지 않으면 시험을 시작하지 않습니다. 시험 중 세션 변경·상태 수신 중단·조건 상실을 확인하면 명령 발행을 멈추며 새 세션으로 자동 재시작하지 않습니다.
+
+출력의 압력(Pa), 실제 속도, 차량 모드를 명령 전·중·후에 비교하세요. 이 예제는 정지 성능을 판정하거나 정지 제동량을 자동 산출하지 않습니다. 정상 완료나 Ctrl+C로 예제를 종료하면 명령 발행이 중단되고, 드라이버는 명령 만료 후 제한된 `0x503 valid=0` 송신을 수행합니다. 이는 물리적인 제동 해제 완료의 확인과 별개입니다.
+
+CAN 소켓과 `/set_control` 서비스는 예제가 사용하지 않습니다. 전체 프로필·상태·timeout 설정은 [드라이버 매뉴얼](../README.md#정지-상태에서-제동-응답-확인하기)을 참고하세요.
+
+## 상태 모니터 설정
 
 다른 토픽으로 연결할 때는 상대 이름 `vehicle_status`를 remap합니다.
 

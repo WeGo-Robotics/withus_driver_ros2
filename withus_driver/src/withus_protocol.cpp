@@ -32,6 +32,18 @@ std::uint8_t read_message_counter(const CanFrame& frame)
 }
 } // namespace
 
+bool decode_remote_control_io(const CanFrame& frame, RemoteControlIo& output)
+{
+    if (!is_standard_data_frame(frame, kRemoteControlIoId)) {
+        return false;
+    }
+
+    RemoteControlIo decoded{};
+    decoded.a_switch_raw = frame.data[2];
+    output = decoded;
+    return true;
+}
+
 bool decode_vehicle_diagnosis(const CanFrame& frame, VehicleDiagnosis& output)
 {
     if (!is_standard_data_frame(frame, kVehicleDiagnosisId)) {

@@ -12,6 +12,13 @@ enum class ReceiveResult
     Error
 };
 
+enum class SendResult
+{
+    Sent,
+    WouldBlock,
+    Error
+};
+
 class SocketCanTransport
 {
 public:
@@ -26,7 +33,7 @@ public:
     bool is_open() const noexcept;
 
     ReceiveResult receive(CanFrame& frame, int timeout_ms);
-
+    SendResult send(const CanFrame& frame);
 private:
     int socket_fd_{-1};
 };

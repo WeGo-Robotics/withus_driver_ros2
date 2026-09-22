@@ -80,3 +80,16 @@ float64 status_304_age_sec
 uint8 status_304_counter
 uint64 status_304_counter_discontinuities
 uint64 status_304_rejected_frames
+
+# 0x10A: raw remote A switch value, initialized to 255 before reception.
+# Other raw values are preserved. selected means raw == 1, not CAN ownership.
+# Values remain cached when stale; always check status_10a_valid.
+uint8 remote_a_raw
+bool remote_a_selected
+
+# 0x10A defines no message counter. Freshness uses feedback_timeout_ms.
+bool status_10a_received
+bool status_10a_valid
+builtin_interfaces/Time status_10a_stamp
+float64 status_10a_age_sec
+uint64 status_10a_rejected_frames

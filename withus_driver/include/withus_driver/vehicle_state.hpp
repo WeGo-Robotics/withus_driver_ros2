@@ -50,6 +50,9 @@ struct FeedbackState
 
 struct VehicleState
 {
+    RemoteControlIo remote_io{};
+    // No message counter is defined for 0x10A; its counter fields are unused.
+    FeedbackState status_10a{};
     VehicleDiagnosis diagnosis{};
     VehicleStatus1 status1{};
     VehicleStatus2 status2{};

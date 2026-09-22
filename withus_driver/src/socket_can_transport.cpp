@@ -7,6 +7,7 @@
 #include <sys/socket.h> //socket, bind
 #include <poll.h> // poll, pollfd
 #include <algorithm> // std::copy_n
+#include <cerrno>
 
 namespace withus_driver
 {
@@ -85,7 +86,7 @@ ReceiveResult SocketCanTransport::receive(
     if(result == 0)
         return ReceiveResult::Timeout;
     if(result < 0)
-        return ReceiveResult::Error;
+        return errno == EINTR ? ReceiveResult::Timeout : ReceiveResult::Error;
 
     /*event check */
     //check the socket error or end event
@@ -106,8 +107,11 @@ ReceiveResult SocketCanTransport::receive(
         MSG_DONTWAIT
     );
 
-    if(received_bytes < 0)
+    if(received_bytes < 0) {
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            return ReceiveResult::Timeout;
         return ReceiveResult::Error;
+    }
     // Linux CAN 프레임 전체를 받았는지 확인
     if(received_bytes != static_cast<ssize_t>(sizeof(raw_frame)))
         return ReceiveResult::Error;
@@ -144,6 +148,52 @@ ReceiveResult SocketCanTransport::receive(
 
     frame = received_frame;
     return ReceiveResult::Received;
+}
+
+SendResult SocketCanTransport::send(const CanFrame& frame)
+{
+    // 표준 classical Can 데이터 프레임 소신
+    if(!is_open() || frame.length > CAN_MAX_DLEN ||
+        frame.id > CAN_SFF_MASK || frame.is_extended ||
+        frame.is_remote || frame.is_error){
+            return SendResult::Error;
+    }
+
+    can_frame raw_frame{};
+    raw_frame.can_id = frame.id;
+    raw_frame.len = frame.length;
+
+    std::copy_n(
+        frame.data.begin(),
+        frame.length,
+        raw_frame.data
+    );
+
+    ssize_t sent_bytes{0};
+
+    do{
+        sent_bytes = ::send(
+            socket_fd_,
+            &raw_frame,
+            sizeof(raw_frame),
+            MSG_DONTWAIT
+        );
+    }while(sent_bytes<0 && errno == EINTR);
+
+    if(sent_bytes < 0){
+        if(errno == EAGAIN ||
+           errno == EWOULDBLOCK ||
+           errno == ENOBUFS){
+            return SendResult::WouldBlock;
+        }
+        return SendResult::Error;
+    }
+
+    if(sent_bytes != static_cast<ssize_t>(sizeof(raw_frame))){
+        return SendResult::Error;
+    }
+
+    return SendResult::Sent;
 }
 
 
