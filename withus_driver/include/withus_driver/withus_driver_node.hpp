@@ -24,6 +24,7 @@ private:
 
     std::mutex state_mutex_;
     VehicleState vehicle_state_;
+    double feedback_timeout_sec_{0.2};
 
     rclcpp::Publisher<withus_msgs::msg::VehicleStatus>::SharedPtr status_publisher_;
     rclcpp::TimerBase::SharedPtr status_timer_;
