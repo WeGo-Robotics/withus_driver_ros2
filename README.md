@@ -7,7 +7,7 @@ Linux SocketCAN으로 `0x301`, `0x303`, `0x304`의 차량 상태와 `0x10A`의 �
 
 공개 프로필은 실차용 `hardware_drive`와 가상 CAN 검증용 `vcan_reference` 두 가지입니다. 상태 수신만 필요하면 같은 launch에 `enable_tx:=false`를 지정합니다. 일반 주행과 정지 목표는 client가 결정하고, 드라이버는 명령 검증·변환·송신과 명령 폐기를 담당합니다.
 
-상태 모니터와 제동 응답 확인 예제의 launch는 `withus_examples`에 있습니다. 이 launch들은 client만 실행하며, 이미 실행한 드라이버를 사용합니다.
+상태 모니터와 키보드 제어 예제의 launch는 `withus_examples`에 있습니다. 이 launch들은 client만 실행하며, 이미 실행한 드라이버를 사용합니다.
 
 ## 패키지 구성
 
@@ -16,7 +16,7 @@ Linux SocketCAN으로 `0x301`, `0x303`, `0x304`의 차량 상태와 `0x10A`의 �
 | [withus_driver](withus_driver/) | SocketCAN 통신, 프레임별 디코딩, ID별 상태 저장, ROS 상태 발행 |
 | [withus_msgs](withus_msgs/) | 차량·드라이버 상태, 주행·장치 명령 메시지와 제어 서비스 |
 | [withus_bringup](withus_bringup/) | 드라이버 launch, CAN 설정 스크립트, 실행 의존성 |
-| [withus_examples](withus_examples/README.md) | Python 상태 구독 및 정지 상태 제동 응답 확인 예제 |
+| [withus_examples](withus_examples/README.md) | Python 상태 모니터 및 키보드 주행 제어 예제 |
 
 ```text
 withus_driver_ros2/
@@ -58,9 +58,9 @@ withus_driver_ros2/
 │   └── package.xml
 └── withus_examples/
     ├── launch/status_monitor.launch.py
-    ├── launch/brake_response_check.launch.py
+    ├── launch/keyboard_teleop.launch.py
     ├── withus_examples/status_monitor.py
-    ├── withus_examples/brake_response_check.py
+    ├── withus_examples/keyboard_teleop.py
     ├── README.md
     ├── setup.py
     ├── setup.cfg
@@ -215,21 +215,40 @@ ros2 launch withus_bringup withus_bringup.launch.py
 
 `DriveCommand`의 제동은 0~100%입니다. CAN의 속도·조향·제동 분해능에 맞춰 기존 인코더가 반올림하며, 위 설정은 시작 시 YAML로 적용합니다. `set_control(true)`는 선택적으로 중지한 요청을 다시 허용하는 기능이며, 이전 목표를 복원하지 않습니다.
 
-### 정지 상태에서 제동 응답 확인하기
+### 상태 모니터와 키보드 제어 함께 실행하기
 
-기본 드라이버를 실행한 채 차량을 정지·중립(N)으로 유지하고 A를 선택합니다. 제동 응답 client는 같은 `/withus/drive_command` API로 속도 0, N, 시작 시 관측한 조향각과 지정한 제동 비율을 보냅니다. 이 예제도 조향·제동·구동 프레임 `0x502/503/504`를 사용합니다.
-
-다른 터미널에서 client만 실행합니다. `10`은 요청값 예시이며 검증된 정지용 제동량을 뜻하지 않습니다.
+터미널 1에서 기본 드라이버를 실행한 뒤, 터미널 2에는 상태 모니터를 실행합니다.
 
 ```bash
 source install/setup.bash
-ros2 launch withus_examples brake_response_check.launch.py \
-  brake_percent:=10 duration:=1.0
+ros2 launch withus_examples status_monitor.launch.py
 ```
 
-드라이버를 추가 실행하거나 프로필을 바꿀 필요는 없습니다. client는 최신 피드백, A 선택, 정지·N, `drive_ready=true`, `drive_active=false`, `control_requested=true`를 최대 5초 기다립니다. 시작 시 조향각은 유한하고 절댓값 0.3rad 이하여야 합니다. 준비되면 한 세션에서 제한된 시간 동안 새 timestamp의 명령을 발행하면서 압력을 관찰합니다. 예제 종료 또는 입력 단절 뒤에는 드라이버의 공통 명령 timeout과 무효화가 적용됩니다. 모드 확인을 완료하지 못하면 드라이버가 구동 명령을 끝낼 수 있습니다.
+터미널 3에는 키보드 client를 실행합니다. 이 터미널에 키를 입력하며 별도 GUI 창은 필요하지 않습니다.
 
-실제 압력과 속도는 `VehicleStatus`로 확인합니다. `drive_active=false`나 valid=0은 물리적인 제동 해제·차량 정지를 보장하지 않습니다. `brake_percent`는 필수이며 0~100, `duration`은 기본 1초이며 0초 초과 1.5초 이하입니다. 세션 변경·조건 상실 뒤 자동 재시작하지 않고, 발행 종료 후 최대 1.5초 동안 압력을 관찰합니다. 자세한 사용법은 [예제 README](withus_examples/README.md)를 참고하세요.
+```bash
+source install/setup.bash
+ros2 launch withus_examples keyboard_teleop.launch.py
+```
+
+| 키 | 동작 |
+| --- | --- |
+| `w` | 선택 속도로 직진, 조향 0. 양의 속도에서는 제동 0% |
+| `a` / `d` | 선택 속도와 좌/우 최대 설정 조향각 요청. 양의 속도에서는 제동 0% |
+| `s` | 속도 0, 제동 **80%**, 조향 **0** 요청 |
+| `q` / `z` | 선택 속도 +0.1 / −0.1 m/s. 정지 중에는 주행을 시작하지 않음 |
+| `1` / `2` / `3` / `4` | P / D / N / R 기어 요청. 정지 상태에서만 변경 |
+| `Ctrl+C` | 명령 발행을 중단하고 client 종료 |
+
+초기 선택 속도는 **0.1 m/s**입니다. 유효한 조작 키 입력이 **1초** 동안 없으면 **명령 발행을 중단**합니다. 이때 자동으로 80% 제동이나 조향 중립을 요청하지 않습니다. 주행 키를 누르고 있거나 반복 입력하여 조작을 갱신합니다. 전진·후진 속도 상한과 최대 조향각은 client 시작 시 실행 중인 드라이버에서 한 번 읽으며 기본값은 각각 1.0 m/s, 0.5 m/s, 0.3 rad입니다. 후진은 `4`로 R을 선택한 뒤 양의 속력으로 요청합니다.
+
+client를 켜기만 해서는 구동 명령을 보내지 않습니다. 차량 정지와 A 선택 후 `s` 또는 기어 키로 준비를 시작합니다. client는 현재 기어·속도 0·제동 80%·조향 0을 먼저 보내고 새 AD 모드 피드백을 기다립니다. 기어 변경은 실제 정지 유지와 새 기어 피드백을 확인하며, 모드·기어 확인을 마친 뒤 **새 `w/a/d` 입력**으로 주행합니다. 주행 중 기어 키는 거부하므로 `s`로 정지를 요청한 뒤 실제 정지 상태에서 다시 선택합니다.
+
+선택 속도가 0이면 `w/a/d`는 속도 0과 기존 제동 요청을 유지하며 조향을 바꿉니다. `q/z`로 속도를 0까지 낮추는 것 자체는 80% 제동 요청이 아니므로 제동은 `s`로 요청합니다.
+
+기본 조향 부호는 `a=양수`, `d=음수`입니다. 제조사 문서에 좌우 부호가 명시되어 있지 않으므로 정지 상태에서 실제 방향을 확인하고, 반대라면 `left_steering_sign:=-1`로 실행합니다. `s`의 80%는 이 client의 정지 요청값이며 드라이버의 공통 정지 정책을 바꾸지 않습니다. 실제 제동·정지 응답은 상태 모니터에서 확인합니다.
+
+입력 timeout이나 Ctrl+C로 발행을 중단하면 드라이버는 마지막 명령 수락 후 기본 200ms에 명령을 만료시키고, 기본 1초 동안 구동 valid=0을 보낸 뒤 구동 송신을 멈춥니다. 이는 실제 제동·정지 완료를 뜻하지 않습니다. 일반 정지가 필요하면 먼저 `s`를 입력하고 실제 응답을 확인하세요. A 해제, 상태 만료, 고장 또는 세션 변경 시에도 이전 목표를 폐기하며, 입력 timeout과 조건 복구 후에는 `s`나 기어 키로 다시 준비합니다. client 종료 후에도 드라이버의 `0x501` 연속 송신은 유지됩니다. 상세 실행 순서와 조정 파라미터는 [예제 매뉴얼](withus_examples/README.md)을 참고하세요.
 
 ### 단일 프레임 수신 확인
 
@@ -254,7 +273,7 @@ ros2 launch withus_examples status_monitor.launch.py
 
 ## ROS 토픽 인터페이스
 
-방향은 드라이버 기준입니다. client나 대시보드는 드라이버가 발행하는 상태 토픽을 구독합니다.
+방향은 드라이버 기준입니다. client는 드라이버가 발행하는 상태 토픽을 구독합니다.
 
 | 방향 | 토픽 | 메시지 타입 | 주기 | 용도 |
 | --- | --- | --- | --- | --- |

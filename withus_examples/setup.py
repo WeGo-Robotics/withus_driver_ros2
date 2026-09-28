@@ -18,7 +18,7 @@ setup(
     zip_safe=True,
     maintainer='wego',
     maintainer_email='chanmgin@wego-robotics.com',
-    description='Withus ROS 2 status monitoring and stationary brake response examples.',
+    description='Withus ROS 2 status monitoring and keyboard control examples.',
     license='TODO: License declaration',
     extras_require={
         'test': [
@@ -28,7 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'status_monitor = withus_examples.status_monitor:main',
-            'brake_response_check = withus_examples.brake_response_check:main',
+            'keyboard_teleop = withus_examples.keyboard_teleop:main',
         ],
     },
 )
