@@ -1,6 +1,7 @@
 """Keyboard client for the hardware_drive DriveCommand interface."""
 
 import argparse
+from contextlib import ExitStack
 from dataclasses import dataclass
 import errno
 import math
@@ -25,14 +26,16 @@ BLOCKING_FIELDS = (
 )
 GEAR_KEYS = {'1': 0, '2': 1, '3': 2, '4': 3}
 GEAR_NAMES = ('P', 'D', 'N', 'R')
+DEFAULT_STOP_BRAKE_PERCENT = 50.0
 HELP = """
 Withus keyboard client (hardware_drive)
-  w: straight       a: maximum left       d: maximum right
-  s: speed 0, brake 80%, steering center (also prepares control)
+  w: selected speed (keep steering)
+  a / d: maximum left / right steering (keep speed, brake, and gear)
+  s: speed 0, brake {stop_brake_percent:g}%, steering center (also prepares control)
   q / z: increase / decrease selected speed
   1 / 2 / 3 / 4: P / D / N / R (stop before changing gear)
   Ctrl+C: stop publishing and exit (does not send a brake command)
-Start with s or a gear key; wait for AD/gear confirmation, then press w/a/d.
+Start with s or a gear key; wait for AD/gear confirmation, then press w to drive or a/d to steer.
 Only run one command client. The status monitor may run in another terminal.
 """
 
@@ -83,28 +86,33 @@ class Target:
     gear: int
     speed: float = 0.0
     steering: float = 0.0
-    brake: float = 80.0
+    brake: float = DEFAULT_STOP_BRAKE_PERCENT
 
 
 class TeleopController:
     """Keep keyboard intent separate from ROS, terminal handling, and feedback."""
 
     def __init__(self, initial_speed=0.1, speed_step=0.1,
-                 key_timeout=1.0, left_sign=1):
+                 key_timeout=1.0, left_sign=1,
+                 stop_brake_percent=DEFAULT_STOP_BRAKE_PERCENT):
         if (not math.isfinite(initial_speed) or initial_speed < 0.0 or
                 not math.isfinite(speed_step) or speed_step <= 0.0 or
                 not math.isfinite(key_timeout) or key_timeout <= 0.0 or
                 left_sign not in (-1, 1)):
             raise ValueError('Invalid keyboard speed, timeout, or steering sign.')
+        if not math.isfinite(stop_brake_percent) or not 0.0 <= stop_brake_percent <= 100.0:
+            raise ValueError('stop_brake_percent must be finite and between 0 and 100.')
         self.selected_speed = initial_speed
         self.speed_step = speed_step
         self.key_timeout = key_timeout
         self.left_sign = left_sign
+        self.stop_brake_percent = stop_brake_percent
         self.limits = None
         self.driver = self.vehicle = None
         self.driver_at = self.vehicle_at = 0.0
         self.session = None
         self.target = None
+        self.selected_gear = None  # Last confirmed choice; never an active command.
         self.phase = 'idle'
         self.notice = 'Waiting for driver limits and fresh status.'
         self.stopped_since = None
@@ -167,12 +175,16 @@ class TeleopController:
             return 'Vehicle mode must be AD (1) or semi-autonomous (3).'
         return ''
 
-    def discard(self, reason):
-        """Clear intent without adopting a replacement session automatically."""
+    def discard(self, reason, remember_gear=False):
+        """Clear commands; normal input expiry may retain a confirmed selection."""
+        if not remember_gear:
+            self.selected_gear = None
         self.session = self.target = self.queued_gear = None
         self.gear_request_ns = None
         self.phase = 'idle'
         self.saw_active = self.confirmed = False
+        if self.selected_gear is not None:
+            reason += f' Remembered gear: {GEAR_NAMES[self.selected_gear]}.'
         self.notice = reason + ' Press s or a gear key again after recovery.'
 
     def stopped(self, now):
@@ -186,20 +198,27 @@ class TeleopController:
             gear = self.target.gear if self.target else self.vehicle.gear
         return self.limits.reverse if gear == 3 else self.limits.forward
 
-    def request_stop(self, reason='Stop requested: brake 80%, steering centered.'):
+    def stopped_target(self, gear):
+        """Use the configured brake for stop, preparation, and gear commands."""
+        return Target(gear, brake=self.stop_brake_percent)
+
+    def request_stop(self, reason=None):
         """Preserve an in-flight gear request while stopping and centering."""
         if self.target is None:
             return False
-        self.target = Target(self.target.gear)
-        if self.phase in ('driving', 'steering'):
+        self.target = self.stopped_target(self.target.gear)
+        if self.phase in ('driving', 'steering', 'waiting_gear'):
             self.phase = 'holding'
-        if self.phase == 'preparing':
+        if self.phase in ('preparing', 'holding'):
+            if self.queued_gear is not None:
+                self.selected_gear = self.target.gear
             self.queued_gear = None
-        self.notice = reason
+        self.notice = reason if reason is not None else (
+            f'Stop requested: brake {self.stop_brake_percent:g}%, steering centered.')
         return True
 
     def _start_gear(self, gear, ros_ns):
-        self.target = Target(gear)
+        self.target = self.stopped_target(gear)
         self.phase = 'gear'
         self.gear_request_ns = ros_ns
         self.queued_gear = None
@@ -217,6 +236,7 @@ class TeleopController:
             if self.session is not None:
                 self.discard(problem)
             else:
+                self.selected_gear = None
                 self.notice = problem
             return False
         if abs(self.vehicle.speed_mps) <= self.limits.stopped_speed:
@@ -251,14 +271,17 @@ class TeleopController:
                 vehicle.ad_signal_received):
             self.confirmed = True
             self.phase = 'holding'
-            self.notice = 'AD confirmed. Press w/a/d to drive, or select a gear.'
+            self.notice = 'AD confirmed. Press w to drive, a/d to steer, or select a gear.'
             if self.queued_gear is not None:
-                if self.stopped(now):
-                    self._start_gear(self.queued_gear, ros_ns)
-                else:
-                    self.queued_gear = None
-                    self.notice = ('AD confirmed. Wait for measured standstill, '
-                                   'then select gear again.')
+                self.phase = 'waiting_gear'
+            else:
+                self.selected_gear = self.target.gear
+        if self.phase == 'waiting_gear':
+            if self.stopped(now):
+                self._start_gear(self.queued_gear, ros_ns)
+            else:
+                self.notice = ('AD confirmed. Keeping the selected gear request while '
+                               'waiting for measured standstill.')
         if self.phase == 'gear' and (
                 vehicle.gear == self.target.gear and
                 stamp_ns(vehicle.status_303_stamp) > self.gear_request_ns and
@@ -267,15 +290,16 @@ class TeleopController:
                 driver.drive_mode_confirmed and not driver.drive_gear_pending):
             self.phase = 'holding'
             self.gear_request_ns = None
+            self.selected_gear = self.target.gear
             self.selected_speed = min(self.selected_speed, self.speed_limit())
             self.notice = (f'{GEAR_NAMES[self.target.gear]} confirmed. '
-                           'Press a new w/a/d key to drive.')
+                           'Press a new w key to drive; a/d only changes steering.')
         if self.phase != 'gear' and driver.drive_gear_pending:
             self.discard('An unexpected gear request is pending in the driver.')
             return False
         if now - self.last_command_key >= self.key_timeout:
             self.discard('Keyboard input timed out: command publishing stopped; '
-                         'no brake was requested.')
+                         'no brake was requested.', remember_gear=True)
             return False
         return True
 
@@ -287,15 +311,20 @@ class TeleopController:
         if abs(self.vehicle.speed_mps) > self.limits.stopped_speed:
             self.notice = 'A new session requires measured standstill.'
             return
+        if self.selected_gear is None:
+            self.selected_gear = self.vehicle.gear
+        desired_gear = self.selected_gear if requested_gear is None else requested_gear
         self.session = self.driver.session_id
-        self.target = Target(self.vehicle.gear)
+        self.target = self.stopped_target(self.vehicle.gear)
         self.phase = 'preparing'
         self.started_at = now
         self.last_command_key = now
         self.saw_active = self.confirmed = False
-        self.queued_gear = (requested_gear if requested_gear != self.vehicle.gear
-                            else None)
-        self.notice = 'Sending zero speed and brake 80%; waiting for full AD confirmation.'
+        self.queued_gear = desired_gear if desired_gear != self.vehicle.gear else None
+        self.notice = (f'Sending zero speed and brake {self.stop_brake_percent:g}%; '
+                       'waiting for full AD confirmation.')
+        if self.queued_gear is not None:
+            self.notice += f' Selected gear after preparation: {GEAR_NAMES[self.queued_gear]}.'
 
     def handle_key(self, key, now, ros_ns):
         """Apply only a current explicit key; rejected motion is never queued."""
@@ -328,11 +357,17 @@ class TeleopController:
             if self.session is None:
                 self._prepare(now, gear)
             elif self.phase == 'gear':
+                if gear == self.target.gear:
+                    self.last_command_key = now
                 self.notice = 'Wait for the pending gear; s remains available.'
-            elif self.phase == 'preparing':
+            elif self.phase in ('preparing', 'waiting_gear'):
                 self.queued_gear = gear if gear != self.target.gear else None
                 self.last_command_key = now
-                self.notice = 'Gear selected; waiting for full AD confirmation at speed 0.'
+                if self.queued_gear is None:
+                    self.selected_gear = self.target.gear
+                if self.confirmed and self.queued_gear is None:
+                    self.phase = 'holding'
+                self.notice = 'Gear selected; waiting for AD and standstill at speed 0.'
             elif not self.stopped(now):
                 self.notice = 'Gear change refused: press s and wait for measured standstill.'
             elif gear == self.target.gear:
@@ -346,18 +381,23 @@ class TeleopController:
             self.notice = ('Motion key ignored. Press s or a gear key, '
                            'then wait for AD/gear confirmation.')
             return
-        if self.target.gear not in (1, 3) and self.selected_speed > 0.0:
-            self.notice = 'Motion key ignored. Select D or R first.'
-            return
-        self.selected_speed = min(self.selected_speed, self.speed_limit())
-        steering = (0.0 if key == 'w' else self.limits.steering *
-                    self.left_sign * (1 if key == 'a' else -1))
-        brake = self.target.brake if self.selected_speed == 0.0 else 0.0
-        self.target = Target(self.target.gear, self.selected_speed, steering, brake)
-        self.phase = 'driving' if self.selected_speed > 0.0 else 'steering'
+        if key in 'ad':
+            steering = self.limits.steering * self.left_sign * (1 if key == 'a' else -1)
+            self.target = Target(self.target.gear, self.target.speed,
+                                 steering, self.target.brake)
+        else:  # w changes longitudinal intent without resetting steering or gear.
+            if self.target.gear not in (1, 3) and self.selected_speed > 0.0:
+                self.notice = 'Motion key ignored. Select D or R first.'
+                return
+            self.selected_speed = min(self.selected_speed, self.speed_limit())
+            brake = self.target.brake if self.selected_speed == 0.0 else 0.0
+            self.target = Target(self.target.gear, self.selected_speed,
+                                 self.target.steering, brake)
+        self.phase = 'driving' if self.target.speed > 0.0 else 'steering'
         self.last_command_key = now
         self.notice = (f'{GEAR_NAMES[self.target.gear]}: speed={self.target.speed:.3f} m/s, '
-                       f'steering={steering:.3f} rad, brake={brake:g}%.')
+                       f'steering={self.target.steering:.3f} rad, '
+                       f'brake={self.target.brake:g}% (selected speed={self.selected_speed:.3f}).')
 
     def tick(self, now, ros_ns):
         """Return the current whole target only while this session remains valid."""
@@ -485,7 +525,8 @@ def create_node(options):
             super().__init__('keyboard_teleop', namespace=options.namespace)
             self.controller = TeleopController(
                 options.initial_speed, options.speed_step,
-                options.key_timeout_sec, options.left_steering_sign)
+                options.key_timeout_sec, options.left_steering_sign,
+                options.stop_brake_percent)
             self.publisher = self.create_publisher(DriveCommand, 'drive_command', 1)
             self.driver_subscription = self.create_subscription(
                 DriverStatus, 'driver_status', self.on_driver, 1)
@@ -501,7 +542,8 @@ def create_node(options):
             self.last_stamp = 0
             self.steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
             self.timer = self.create_timer(0.02, self.on_timer, clock=self.steady_clock)
-            self.get_logger().info(HELP)
+            self.get_logger().info(HELP.format(
+                stop_brake_percent=self.controller.stop_brake_percent))
             self.get_logger().info(
                 f'Input timeout={options.key_timeout_sec:g} s; '
                 f'left steering sign={options.left_steering_sign:+d}. '
@@ -589,6 +631,8 @@ def main(args=None):
     parser.add_argument('--driver-node', default='')
     parser.add_argument('--initial-speed', type=float, default=0.1)
     parser.add_argument('--speed-step', type=float, default=0.1)
+    parser.add_argument('--stop-brake-percent', type=float, default=DEFAULT_STOP_BRAKE_PERCENT,
+                        help='Brake request for s, preparation, and gear changes (0..100%%).')
     parser.add_argument('--key-timeout-sec', type=float, default=1.0)
     parser.add_argument('--left-steering-sign', type=int, choices=(-1, 1), default=1)
     parser.add_argument('--terminal-fd', type=int)
@@ -596,10 +640,12 @@ def main(args=None):
     options = parser.parse_args(remove_ros_args(args=command_line)[1:])
     try:
         TeleopController(options.initial_speed, options.speed_step,
-                         options.key_timeout_sec, options.left_steering_sign)
+                         options.key_timeout_sec, options.left_steering_sign,
+                         options.stop_brake_percent)
     except ValueError as error:
         parser.error(str(error))
-    terminal = node = None
+    from withus_examples.teleop_screen import TerminalScreen
+
     previous_handlers = {signum: signal.getsignal(signum)
                          for signum in (signal.SIGINT, signal.SIGTERM)}
     stop_requested = False
@@ -608,47 +654,55 @@ def main(args=None):
         nonlocal stop_requested
         stop_requested = True
 
-    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
-    for signum in previous_handlers:
-        signal.signal(signum, interrupted)
+    def restore_handlers():
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+    def shutdown_ros():
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    # Keep ROS logs in their files and /rosout, away from the fixed terminal view.
+    ros_args = [command_line[0], '--ros-args', '--disable-stdout-logs', '--',
+                *command_line[1:]]
+    rclpy.init(args=ros_args, signal_handler_options=SignalHandlerOptions.NO)
     try:
-        terminal = TerminalInput(options.terminal_fd)
-        node = create_node(options)
-        while rclpy.ok() and not stop_requested:
-            rclpy.spin_once(node, timeout_sec=0.01)
-            if stop_requested:
-                break
-            for key in terminal.read():
-                if key == '\x03':
-                    stop_requested = True
+        with ExitStack() as cleanup:
+            cleanup.callback(restore_handlers)
+            cleanup.callback(shutdown_ros)
+            for signum in previous_handlers:
+                signal.signal(signum, interrupted)
+            terminal = TerminalInput(options.terminal_fd)
+            cleanup.callback(terminal.close)
+            node = create_node(options)
+            cleanup.callback(node.destroy_node)
+            screen = TerminalScreen(terminal.fd)
+            cleanup.callback(screen.close)
+            cleanup.callback(node.stop_for_exit)
+            last_key = '-'
+            next_display = 0.0
+            while rclpy.ok() and not stop_requested:
+                rclpy.spin_once(node, timeout_sec=0.01)
+                if stop_requested:
                     break
-                node.key(key)
-            if terminal.eof:
-                break
+                for key in terminal.read():
+                    if key == '\x03':
+                        stop_requested = True
+                        break
+                    last_key = key
+                    node.key(key)
+                if terminal.eof or stop_requested:
+                    break
+                now = time.monotonic()
+                if now >= next_display:
+                    screen.render(node.controller, now, node.get_clock().now().nanoseconds,
+                                  last_key=last_key)
+                    next_display = now + 0.1
     except (ExternalShutdownException, KeyboardInterrupt):
         pass
     except (OSError, RuntimeError) as error:
         print(f'Keyboard teleop: {error}', file=sys.stderr)
         return 1
-    finally:
-        try:
-            if node is not None:
-                node.stop_for_exit()
-        finally:
-            try:
-                if terminal is not None:
-                    terminal.close()
-            finally:
-                try:
-                    if node is not None:
-                        node.destroy_node()
-                finally:
-                    try:
-                        if rclpy.ok():
-                            rclpy.shutdown()
-                    finally:
-                        for signum, handler in previous_handlers.items():
-                            signal.signal(signum, handler)
     return 0
 
 

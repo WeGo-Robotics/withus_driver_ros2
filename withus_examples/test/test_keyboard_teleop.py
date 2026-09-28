@@ -124,13 +124,27 @@ def test_gear_key_bootstraps_zero_then_waits_for_new_ack_and_new_motion_key():
     assert rig.client.target.speed == 0.1
 
 
-@pytest.mark.parametrize('key,angle', [('w', 0.0), ('a', 0.3), ('d', -0.3)])
-def test_motion_keys_and_explicit_s_stop(key, angle):
+@pytest.mark.parametrize('key,angle', [('a', 0.3), ('d', -0.3)])
+def test_steering_only_keeps_stopped_speed_brake_and_gear(key, angle):
     rig = Rig()
     rig.arm()
-    assert rig.key(key) == Target(1, 0.1, angle, 0.0)
-    assert rig.key('s') == Target(1, 0.0, 0.0, 80.0)
+    assert rig.client.selected_speed == 0.1
+    assert rig.key(key) == Target(1, 0.0, angle, 50.0)
+    assert rig.key('s') == Target(1, 0.0, 0.0, 50.0)
     assert rig.client.phase == 'holding'
+
+
+@pytest.mark.parametrize('gear', [1, 3])
+def test_speed_and_steering_change_independently_with_same_gear(gear):
+    rig = Rig()
+    rig.arm(gear)
+    assert rig.key('a') == Target(gear, 0.0, 0.3, 50.0)
+    assert rig.key('w') == Target(gear, 0.1, 0.3, 0.0)
+    assert rig.key('q') == Target(gear, 0.2, 0.3, 0.0)
+    assert rig.key('d') == Target(gear, 0.2, -0.3, 0.0)
+    assert rig.key('w') == Target(gear, 0.2, -0.3, 0.0)
+    assert rig.key('z') == Target(gear, 0.1, -0.3, 0.0)
+    assert rig.key('s') == Target(gear, 0.0, 0.0, 50.0)
 
 
 def test_configurable_steering_sign_and_driver_limits():
@@ -139,7 +153,8 @@ def test_configurable_steering_sign_and_driver_limits():
     rig.arm()
     rig.key('q')
     assert rig.client.selected_speed == 0.15
-    assert rig.key('a') == Target(1, 0.15, -0.12, 0.0)
+    assert rig.key('a') == Target(1, 0.0, -0.12, 50.0)
+    assert rig.key('w') == Target(1, 0.15, -0.12, 0.0)
     assert rig.key('d') == Target(1, 0.15, 0.12, 0.0)
     rig.key('s')
     rig.key('4')
@@ -172,6 +187,7 @@ def test_speed_adjustment_clamps_without_starting_motion():
 def test_input_timeout_stops_publication_without_braking_or_replaying():
     rig = Rig(key_timeout=1.0)
     rig.arm()
+    rig.key('w')
     rig.key('a')
     rig.advance(0.6)
     assert rig.client.target.speed == 0.1
@@ -215,8 +231,10 @@ def test_moving_gear_is_rejected_and_s_preserves_pending_gear():
 def test_park_and_neutral_never_receive_motion_targets(gear):
     rig = Rig()
     rig.arm(gear)
-    for key in 'wad':
-        assert rig.key(key) == Target(gear)
+    assert rig.key('w') == Target(gear)
+    assert rig.key('a') == Target(gear, 0.0, 0.3, 50.0)
+    assert rig.key('d') == Target(gear, 0.0, -0.3, 50.0)
+    assert rig.key('w') == Target(gear, 0.0, -0.3, 50.0)
 
 
 @pytest.mark.parametrize('fault', ['remote', 'session', 'inactive', 'can',
@@ -317,12 +335,11 @@ def test_inactivity_also_ends_stop_and_gear_preparation_commands(key):
 def test_stationary_steering_requires_fresh_motion_key_to_accelerate():
     rig = Rig()
     rig.arm()
-    rig.key('z')
-    assert rig.key('a') == Target(1, 0.0, 0.3, 80.0)
+    assert rig.key('a') == Target(1, 0.0, 0.3, 50.0)
     rig.key('q')
-    assert rig.client.selected_speed == 0.1
-    assert rig.client.target == Target(1, 0.0, 0.3, 80.0)
-    assert rig.key('w') == Target(1, 0.1, 0.0, 0.0)
+    assert rig.client.selected_speed == 0.2
+    assert rig.client.target == Target(1, 0.0, 0.3, 50.0)
+    assert rig.key('w') == Target(1, 0.2, 0.3, 0.0)
 
 
 def test_old_driver_snapshot_cannot_acknowledge_new_vehicle_gear():
@@ -353,3 +370,217 @@ def test_terminal_hangup_does_not_prevent_remaining_cleanup():
         os.fstat(slave)
     assert error.value.errno == errno.EBADF
     terminal.close()  # Repeated finally/cleanup calls are harmless.
+
+
+@pytest.mark.parametrize('key,gear', [('1', 0), ('2', 1), ('4', 3)])
+def test_one_gear_press_survives_ad_confirmation_before_local_stopped_dwell(key, gear):
+    rig = Rig()
+    # Driver is already ready, while this newly started client has less than
+    # 200 ms of local feedback. Fast AD confirmation must not erase the key.
+    assert rig.key(key) == Target(2)
+    rig.driver.drive_active = True
+    rig.driver.drive_mode_confirmed = True
+    rig.vehicle.drive_mode = 1
+    assert rig.advance(0.02) == Target(2)
+    assert rig.client.phase == 'waiting_gear'
+    assert rig.client.queued_gear == gear
+    rig.key('w')
+    assert rig.client.target == Target(2)
+    assert rig.advance(0.19) == Target(gear)
+    assert rig.client.phase == 'gear'
+    rig.vehicle.gear = gear
+    assert rig.advance() == Target(gear)
+    assert rig.client.phase == 'holding'
+    for key in 'adqzs':
+        rig.key(key)
+        assert rig.advance(0.1).gear == gear
+        assert rig.client.target.speed == 0.0
+
+
+def test_repeating_pending_gear_keeps_input_alive_without_restarting_ack_deadline():
+    rig = Rig()
+    rig.arm()
+    rig.key('4')
+    requested = rig.client.gear_request_ns
+    rig.driver.drive_gear_pending = True
+    rig.advance(0.6)
+    rig.key('4')
+    assert rig.advance(0.5) == Target(3)
+    assert rig.client.gear_request_ns == requested
+    rig.key('2')  # A different gear cannot replace an in-flight request.
+    assert rig.client.target == Target(3)
+    assert rig.advance(0.51) is None
+
+
+def test_s_cancels_a_gear_queued_before_stationary_dwell():
+    rig = Rig()
+    rig.key('2')
+    rig.driver.drive_active = True
+    rig.driver.drive_mode_confirmed = True
+    rig.vehicle.drive_mode = 1
+    rig.advance()
+    assert rig.client.phase == 'waiting_gear'
+    assert rig.key('s') == Target(2)
+    assert rig.client.queued_gear is None
+    assert rig.advance(0.21) == Target(2)
+    assert rig.client.phase == 'holding'
+
+
+def test_idle_remembers_confirmed_gear_but_only_explicit_s_can_restore_it():
+    rig = Rig()
+    rig.arm(1)
+    rig.key('w')
+    rig.key('d')
+    assert rig.advance(1.01) is None
+    assert rig.client.selected_gear == 1
+    assert rig.client.session is None
+    rig.driver.drive_active = False
+    rig.driver.drive_mode_confirmed = False
+    rig.driver.session_id += 1
+    rig.vehicle.drive_mode = 3
+    rig.vehicle.gear = 2  # Feedback may differ after command publication ends.
+    assert rig.advance(0.21) is None
+    assert rig.key('w') is None
+    assert rig.key('a') is None
+    assert rig.client.selected_gear == 1
+    assert rig.key('s') == Target(2)  # Always start with the observed gear.
+    assert rig.client.queued_gear == 1
+    rig.driver.drive_active = True
+    rig.driver.drive_mode_confirmed = True
+    rig.vehicle.drive_mode = 1
+    assert rig.advance() == Target(1)
+    rig.vehicle.gear = 1
+    assert rig.advance() == Target(1)
+    assert rig.client.selected_gear == 1
+    assert rig.client.phase == 'holding'
+    assert rig.key('a') == Target(1, 0.0, 0.3, 50.0)
+    assert rig.key('w') == Target(1, 0.1, 0.3, 0.0)
+
+
+def test_unacknowledged_shift_is_not_remembered_on_idle():
+    rig = Rig()
+    rig.arm(1)
+    rig.key('4')
+    assert rig.client.target.gear == 3
+    assert rig.client.selected_gear == 1
+    assert rig.advance(1.01) is None
+    assert rig.client.selected_gear == 1
+    assert rig.client.queued_gear is None
+
+
+@pytest.mark.parametrize('fault', ['remote', 'stale', 'blocked'])
+def test_fault_while_idle_clears_remembered_gear(fault):
+    rig = Rig()
+    rig.arm(1)
+    rig.advance(1.01)
+    assert rig.client.selected_gear == 1
+    rig.driver.drive_active = False
+    rig.driver.drive_mode_confirmed = False
+    rig.vehicle.drive_mode = 3
+    rig.vehicle.gear = 2
+    if fault == 'remote':
+        rig.vehicle.remote_a_raw = 0
+    elif fault == 'blocked':
+        rig.vehicle.eps_fault = True
+    if fault == 'stale':
+        rig.advance(0.3, fresh=False)
+    else:
+        rig.advance()
+    assert rig.client.selected_gear is None
+    rig.vehicle.remote_a_raw = 1
+    rig.vehicle.eps_fault = False
+    rig.advance()
+    assert rig.key('s') == Target(2)
+    assert rig.client.queued_gear is None
+
+
+@pytest.mark.parametrize('key,queued,remembered', [('4', 3, 1), ('3', None, 2)])
+def test_new_numeric_key_overrides_remembered_gear(key, queued, remembered):
+    rig = Rig()
+    rig.arm(1)
+    rig.advance(1.01)
+    rig.driver.drive_active = False
+    rig.driver.drive_mode_confirmed = False
+    rig.vehicle.drive_mode = 3
+    rig.vehicle.gear = 2
+    rig.advance()
+    assert rig.key('s') == Target(2)
+    assert rig.client.queued_gear == 1
+    rig.key(key)
+    assert rig.client.queued_gear == queued
+    assert rig.client.selected_gear == remembered
+
+
+def test_repeated_s_cancels_remembered_gear_restoration_before_shift():
+    rig = Rig()
+    rig.arm(1)
+    rig.advance(1.01)
+    rig.driver.drive_active = False
+    rig.driver.drive_mode_confirmed = False
+    rig.vehicle.drive_mode = 3
+    rig.vehicle.gear = 2
+    rig.advance()
+    rig.key('s')
+    assert rig.client.queued_gear == 1
+    rig.key('s')
+    assert rig.client.queued_gear is None
+    assert rig.client.selected_gear == 2
+    rig.driver.drive_active = True
+    rig.driver.drive_mode_confirmed = True
+    rig.vehicle.drive_mode = 1
+    assert rig.advance() == Target(2)
+
+
+@pytest.mark.parametrize('brake', [0.0, 30.0, 30.5, 50.0, 100.0])
+def test_configured_brake_applies_to_preparation_gear_stop_steering_and_rearm(brake):
+    rig = Rig(stop_brake_percent=brake)
+    rig.advance(0.21)
+    assert rig.key('2') == Target(2, brake=brake)
+    rig.driver.drive_active = True
+    rig.driver.drive_mode_confirmed = True
+    rig.vehicle.drive_mode = 1
+    assert rig.advance() == Target(1, brake=brake)
+    rig.vehicle.gear = 1
+    assert rig.advance() == Target(1, brake=brake)
+    assert rig.key('a') == Target(1, 0.0, 0.3, brake)
+    assert rig.key('w') == Target(1, 0.1, 0.3, 0.0)
+    assert rig.key('s') == Target(1, brake=brake)
+    assert f'brake {brake:g}%' in rig.client.notice
+    assert rig.key('d') == Target(1, 0.0, -0.3, brake)
+    assert rig.key('4') == Target(3, brake=brake)
+    assert rig.key('s') == Target(3, brake=brake)
+    rig.vehicle.gear = 3
+    assert rig.advance() == Target(3, brake=brake)
+    assert rig.advance(1.01) is None
+    rig.driver.drive_active = False
+    rig.driver.drive_mode_confirmed = False
+    rig.driver.session_id += 1
+    rig.vehicle.drive_mode = 3
+    rig.vehicle.gear = 2
+    assert rig.advance(0.21) is None
+    assert rig.key('s') == Target(2, brake=brake)
+    rig.driver.drive_active = True
+    rig.driver.drive_mode_confirmed = True
+    rig.vehicle.drive_mode = 1
+    assert rig.advance() == Target(3, brake=brake)
+    rig.vehicle.gear = 3
+    assert rig.advance() == Target(3, brake=brake)
+    assert rig.key('a') == Target(3, 0.0, 0.3, brake)
+    assert rig.key('w') == Target(3, 0.1, 0.3, 0.0)
+
+
+def test_default_brake_is_50_and_zero_speed_w_preserves_configured_brake():
+    rig = Rig()
+    rig.arm()
+    assert rig.client.stop_brake_percent == 50.0
+    assert rig.client.target.brake == 50.0
+    rig = Rig(initial_speed=0.0, stop_brake_percent=30.0)
+    rig.arm()
+    assert rig.key('w') == Target(1, brake=30.0)
+    assert rig.key('a') == Target(1, 0.0, 0.3, 30.0)
+
+
+@pytest.mark.parametrize('brake', [-0.1, 100.1, float('nan'), float('inf'), -float('inf')])
+def test_invalid_stop_brake_is_rejected_before_commands_can_be_created(brake):
+    with pytest.raises(ValueError, match='stop_brake_percent'):
+        TeleopController(stop_brake_percent=brake)
