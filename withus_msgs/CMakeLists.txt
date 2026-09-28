@@ -15,7 +15,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/VehicleStatus.msg"
   "msg/DriveCommand.msg"
   "msg/BodyCommand.msg"
-  "msg/BrakeTestCommand.msg"
   "msg/DriverStatus.msg"
   "srv/SetControl.srv"
   DEPENDENCIES std_msgs builtin_interfaces

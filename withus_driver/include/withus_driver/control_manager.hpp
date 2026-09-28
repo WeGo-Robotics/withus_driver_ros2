@@ -9,9 +9,9 @@
 namespace withus_driver
 {
 
-// VcanReference controls the virtual vehicle. ModeOnly confirms mode requests.
-// RemoteMode continuously broadcasts the request and only observes feedback.
-// Neither mode-only policy commands or guarantees vehicle braking or ownership.
+// VcanReference controls the virtual vehicle. HardwareDrive continuously
+// broadcasts 0x501 and observes the mode; HardwareDriveController separately
+// owns real actuator commands. A mode request alone does not imply ownership.
 class ControlManager
 {
 public:
@@ -24,7 +24,7 @@ public:
         Active = 3, Stopping = 4, Fault = 5
     };
 
-    enum class Policy { VcanReference, ModeOnly, RemoteMode };
+    enum class Policy { VcanReference, HardwareDrive };
 
     struct Config
     {
@@ -116,15 +116,9 @@ private:
     void fail(const std::string& reason);
     void clear_commands();
     void build_intent(const Feedback& feedback, TimePoint now);
-    bool mode_stationary_healthy(const Feedback& feedback) const noexcept;
-    Result set_mode_enabled(bool enable, const Feedback& feedback, TimePoint now);
-    void tick_mode(const Feedback& feedback, TimePoint now);
-    void begin_mode_release(TimePoint now, const std::string& reason, bool fault);
-    void mark_mode_release_fault(const std::string& reason);
-    void build_mode_intent();
-    Result set_remote_enabled(bool enable, const Feedback& feedback, TimePoint now);
-    void tick_remote(const Feedback& feedback, TimePoint now);
-    void build_remote_intent();
+    Result set_hardware_request_enabled(bool enable, const Feedback& feedback, TimePoint now);
+    void tick_hardware_request(const Feedback& feedback, TimePoint now);
+    void build_hardware_request_intent();
 
     Config config_;
     State state_{State::Monitoring};
@@ -147,11 +141,9 @@ private:
     std::uint64_t phase_sequence_{0};
     Gear stopping_gear_{Gear::Park};
     double held_steering_rad_{0.0};
-    bool mode_request_sent_{false};
-    bool mode_release_sent_{false};
-    bool mode_release_fault_{false};
-    bool remote_request_enabled_{true};
-    bool remote_tx_failed_{false};
+    bool hardware_release_sent_{false};
+    bool hardware_request_enabled_{true};
+    bool hardware_request_tx_failed_{false};
 };
 
 }  // namespace withus_driver

@@ -49,7 +49,7 @@ add_executable(withus_driver_node
   src/main.cpp
   src/withus_driver_node.cpp
   src/control_manager.cpp
-  src/brake_test_controller.cpp
+  src/hardware_drive_controller.cpp
   src/can_interface.cpp
 )
 
@@ -108,20 +108,20 @@ ament_export_targets(
 
 if(BUILD_TESTING)
   find_package(ament_cmake_test REQUIRED)
-  foreach(test_name IN ITEMS test_control_manager test_mode_only_control_manager test_remote_mode_control_manager)
+  foreach(test_name IN ITEMS test_control_manager test_hardware_mode_request)
     add_executable(${test_name} test/${test_name}.cpp src/control_manager.cpp)
     target_compile_features(${test_name} PRIVATE cxx_std_17)
     target_include_directories(${test_name} PRIVATE include)
     ament_add_test(${test_name} COMMAND "$<TARGET_FILE:${test_name}>"
       GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
   endforeach()
-  add_executable(test_brake_test_controller
-    test/test_brake_test_controller.cpp src/brake_test_controller.cpp)
-  target_compile_features(test_brake_test_controller PRIVATE cxx_std_17)
-  target_include_directories(test_brake_test_controller PRIVATE include)
-  ament_add_test(test_brake_test_controller COMMAND "$<TARGET_FILE:test_brake_test_controller>"
-    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
   # The CAN/ROS integration test is run explicitly on an existing vcan link.
+  add_executable(test_hardware_drive_controller
+    test/test_hardware_drive_controller.cpp src/hardware_drive_controller.cpp)
+  target_compile_features(test_hardware_drive_controller PRIVATE cxx_std_17)
+  target_include_directories(test_hardware_drive_controller PRIVATE include)
+  ament_add_test(test_hardware_drive_controller COMMAND "$<TARGET_FILE:test_hardware_drive_controller>"
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO)
 endif()
 
 ament_package()

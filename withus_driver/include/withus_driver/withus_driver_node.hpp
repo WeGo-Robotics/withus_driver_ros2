@@ -10,12 +10,11 @@
 #include "withus_driver/socket_can_transport.hpp"
 #include "withus_driver/vehicle_state.hpp"
 #include "withus_driver/control_manager.hpp"
-#include "withus_driver/brake_test_controller.hpp"
+#include "withus_driver/hardware_drive_controller.hpp"
 #include "withus_msgs/msg/vehicle_status.hpp"
 #include "withus_msgs/msg/driver_status.hpp"
 #include "withus_msgs/msg/drive_command.hpp"
 #include "withus_msgs/msg/body_command.hpp"
-#include "withus_msgs/msg/brake_test_command.hpp"
 #include "withus_msgs/srv/set_control.hpp"
 #include "sensor_msgs/msg/battery_state.hpp"
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
@@ -31,7 +30,7 @@ public:
     bool ready_to_shutdown() const;
     bool control_released() const {
         return control_->state() == ControlManager::State::Monitoring &&
-               (!brake_test_ || (!brake_test_->active() && !brake_test_->releasing()));
+               (!hardware_drive_ || (!hardware_drive_->active() && !hardware_drive_->invalidating()));
     }
     std::chrono::milliseconds shutdown_timeout() const { return shutdown_timeout_; }
 private:
@@ -45,24 +44,22 @@ private:
     void reject(const std::string& reason);
     void on_drive(const withus_msgs::msg::DriveCommand& msg);
     void on_body(const withus_msgs::msg::BodyCommand& msg);
-    void on_brake_test(const withus_msgs::msg::BrakeTestCommand& msg);
     void transmit(bool body_only);
-    void transmit_brake_test();
+    void transmit_hardware_drive();
     SocketCanTransport transport_;
     std::unique_ptr<ControlManager> control_;
-    std::unique_ptr<BrakeTestController> brake_test_;
+    std::unique_ptr<HardwareDriveController> hardware_drive_;
     std::mutex state_mutex_;
     VehicleState vehicle_state_;
     std::uint64_t status_303_sequence_{0};
     double feedback_timeout_sec_{0.2};
     std::string base_frame_id_;
     std::string control_profile_;
-    bool mode_only_{false};
     std::array<std::uint8_t, 5> counters_{};
     std::int64_t max_command_age_ns_{0}, future_tolerance_ns_{0}, active_ros_ns_{0};
     std::int64_t last_ros_ns_{0}, last_drive_stamp_{0}, last_body_stamp_{0};
-    std::int64_t last_brake_test_stamp_{0};
-    std::uint64_t brake_session_id_{0};
+    std::uint64_t drive_session_id_{0};
+    bool drive_mode_confirmed_{false}, drive_gear_pending_{false};
     std::uint64_t rejected_commands_{0}, tx_sent_frames_{0}, tx_failed_frames_{0};
     std::string last_rejection_;
     bool shutting_down_{false};
@@ -73,7 +70,6 @@ private:
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
     rclcpp::Subscription<withus_msgs::msg::DriveCommand>::SharedPtr drive_subscription_;
     rclcpp::Subscription<withus_msgs::msg::BodyCommand>::SharedPtr body_subscription_;
-    rclcpp::Subscription<withus_msgs::msg::BrakeTestCommand>::SharedPtr brake_test_subscription_;
     rclcpp::Service<withus_msgs::srv::SetControl>::SharedPtr control_service_;
     rclcpp::TimerBase::SharedPtr status_timer_, tx_timer_, body_timer_, diagnostics_timer_;
     std::atomic<bool> stop_requested_{false}, can_connected_{false};

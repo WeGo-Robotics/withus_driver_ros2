@@ -10,9 +10,10 @@ def generate_launch_description():
     arguments = [
         DeclareLaunchArgument("can_interface", default_value="can0"),
         DeclareLaunchArgument("feedback_timeout_ms", default_value="200"),
-        DeclareLaunchArgument("enable_tx", default_value="false"),
-        DeclareLaunchArgument("control_profile", default_value="monitor_only",
-                              description="monitor_only, vcan_reference, hardware_mode_only, hardware_remote_mode, or hardware_brake_test"),
+        DeclareLaunchArgument("enable_tx", default_value="true"),
+        DeclareLaunchArgument("control_profile", default_value="hardware_drive",
+                              description="hardware_drive or vcan_reference",
+                              choices=["hardware_drive", "vcan_reference"]),
         DeclareLaunchArgument("params_file", default_value=PathJoinSubstitution([
             FindPackageShare("withus_bringup"), "config", "withus_driver.yaml"])),
     ]

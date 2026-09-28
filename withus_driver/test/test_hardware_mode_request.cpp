@@ -25,7 +25,7 @@ M::Config config(bool tx = true)
 {
     M::Config result;
     result.tx_enabled = tx;
-    result.policy = M::Policy::RemoteMode;
+    result.policy = M::Policy::HardwareDrive;
     return result;
 }
 struct Fixture
@@ -78,13 +78,13 @@ int main()
         check(std::isnan(f.manager.command_age_sec(f.now)), "no drive-command age");
         M::DriveTarget drive;
         drive.session_id = f.manager.session_id();
-        check(!f.manager.accept_drive(drive, f.feedback, f.now).accepted, "drive rejected");
+        check(!f.manager.accept_drive(drive, f.feedback, f.now).accepted, "actuators belong to HardwareDriveController");
         withus_driver::BodyCommand body;
         body.horn_on = true;
         check(!f.manager.accept_body(f.manager.session_id(), body, f.now).accepted, "body rejected");
         f.only(true);
     }
-    // Every received value is observational in this profile. In particular,
+    // Every received value is observational for this request broadcaster. In particular,
     // 501-only operation can report semi-autonomous mode 3 on the real vehicle.
     for (int observation = 0; observation < 15; ++observation) {
         Fixture f;
@@ -231,5 +231,5 @@ int main()
         check(disabled.state() == S::Monitoring && !disabled.intent().transmit,
               "already disabled profile needs no release transmission");
     }
-    std::cout << checks << " continuous-request control manager assertions passed.\n";
+    std::cout << checks << " hardware continuous-request control manager assertions passed.\n";
 }

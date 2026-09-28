@@ -7,6 +7,8 @@
   <maintainer email="chanmgin@wego-robotics.com">wego</maintainer>
   <license>TODO: License declaration</license>
 
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>withus_msgs</exec_depend>

@@ -32,16 +32,15 @@ ControlManager::ControlManager(const Config& config, std::uint64_t session_seed)
         config_.request_timeout.count() <= 0 || config_.stop_timeout.count() <= 0 ||
         config_.release_timeout.count() <= 0 || config_.stopped_dwell.count() <= 0 ||
         config_.stopped_dwell >= config_.stop_timeout || session_seed == 0 ||
-        (config_.policy != Policy::VcanReference && config_.policy != Policy::ModeOnly &&
-         config_.policy != Policy::RemoteMode))
+        (config_.policy != Policy::VcanReference && config_.policy != Policy::HardwareDrive))
     {
         throw std::invalid_argument("Invalid control manager configuration.");
     }
-    if (config_.policy == Policy::RemoteMode) {
+    if (config_.policy == Policy::HardwareDrive) {
         reason_ = config_.tx_enabled ?
             "Continuous 0x501 request=1; vehicle feedback is observation only, without an AD ownership claim." :
             "Transmission is disabled by configuration.";
-        build_remote_intent();
+        build_hardware_request_intent();
     }
 }
 
@@ -97,16 +96,16 @@ void ControlManager::fail(const std::string& reason)
     intent_ = TxIntent{};
 }
 
-void ControlManager::on_tx_failure(const std::string& reason, TimePoint now)
+void ControlManager::on_tx_failure(const std::string& reason, TimePoint)
 {
-    if (config_.policy == Policy::RemoteMode) {
+    if (config_.policy == Policy::HardwareDrive) {
         if (state_ == State::Disconnected) {
             return;
         }
-        remote_tx_failed_ = true;
+        hardware_request_tx_failed_ = true;
         if (state_ == State::Stopping) {
             // Retry the same zero request without moving the release deadline.
-            mode_release_sent_ = false;
+            hardware_release_sent_ = false;
             reason_ = "CAN transmission failed: " + reason +
                 ". Retrying request=0 until the existing release deadline.";
         } else {
@@ -114,15 +113,7 @@ void ControlManager::on_tx_failure(const std::string& reason, TimePoint now)
             reason_ = "CAN transmission failed: " + reason +
                 ". The configured 0x501 request remains unchanged and will be retried.";
         }
-        build_remote_intent();
-        return;
-    }
-    if (config_.policy == Policy::ModeOnly &&
-        (state_ == State::Requesting || state_ == State::Active || state_ == State::Stopping))
-    {
-        // A failed/nonblocking write must never leave a request=1 retry intent.
-        // Bounded request=0 retries are still only best effort, not a stop command.
-        begin_mode_release(now, "CAN transmission failed: " + reason, true);
+        build_hardware_request_intent();
         return;
     }
     // No claim of a successful stop is possible after a failed CAN write.
@@ -140,11 +131,8 @@ void ControlManager::on_disconnect()
 ControlManager::Result ControlManager::set_enabled(
     bool enable, const Feedback& feedback, TimePoint now)
 {
-    if (config_.policy == Policy::RemoteMode) {
-        return set_remote_enabled(enable, feedback, now);
-    }
-    if (config_.policy == Policy::ModeOnly) {
-        return set_mode_enabled(enable, feedback, now);
+    if (config_.policy == Policy::HardwareDrive) {
+        return set_hardware_request_enabled(enable, feedback, now);
     }
     update_stationary(feedback, now);
     if (!enable) {
@@ -214,7 +202,7 @@ ControlManager::Result ControlManager::accept_drive(
     const DriveTarget& target, const Feedback& feedback, TimePoint now)
 {
     if (config_.policy != Policy::VcanReference) {
-        return {false, "Drive commands are unavailable in mode-only control."};
+        return {false, "Hardware actuator commands are handled by HardwareDriveController."};
     }
     if (state_ != State::Active || target.session_id != session_id_) {
         return {false, "Drive command requires ACTIVE and the current session_id."};
@@ -257,7 +245,7 @@ ControlManager::Result ControlManager::accept_body(
     std::uint64_t session, const BodyCommand& body, TimePoint now)
 {
     if (config_.policy != Policy::VcanReference) {
-        return {false, "Body commands are unavailable in mode-only control."};
+        return {false, "Body commands are unavailable in hardware_drive."};
     }
     if (state_ != State::Active || session != session_id_) {
         return {false, "Body command requires ACTIVE and the current session_id."};
@@ -290,12 +278,8 @@ void ControlManager::begin_stopping(
 
 void ControlManager::tick(const Feedback& feedback, TimePoint now)
 {
-    if (config_.policy == Policy::RemoteMode) {
-        tick_remote(feedback, now);
-        return;
-    }
-    if (config_.policy == Policy::ModeOnly) {
-        tick_mode(feedback, now);
+    if (config_.policy == Policy::HardwareDrive) {
+        tick_hardware_request(feedback, now);
         return;
     }
     update_stationary(feedback, now);
@@ -428,212 +412,31 @@ double ControlManager::command_age_sec(TimePoint now) const noexcept
            std::numeric_limits<double>::quiet_NaN();
 }
 
-bool ControlManager::mode_stationary_healthy(const Feedback& feedback) const noexcept
-{
-    // No steering command is sent by this policy, so do not impose the virtual
-    // vehicle's steering target bound on measured physical steering.
-    return feedback.all_fresh && !feedback.blocked && feedback.gear == Gear::Neutral &&
-           std::isfinite(feedback.speed_mps) && std::isfinite(feedback.steering_angle_rad) &&
-           std::abs(feedback.speed_mps) <= config_.stopped_speed_mps;
-}
-
-ControlManager::Result ControlManager::set_mode_enabled(
-    bool enable, const Feedback& feedback, TimePoint now)
-{
-    if (!enable) {
-        if (state_ == State::Monitoring) {
-            return {true, "Already monitoring."};
-        }
-        if (state_ == State::Disconnected) {
-            return {false, "CAN receive loop is disconnected; restart the node."};
-        }
-        if (state_ == State::Stopping) {
-            return {true, "Mode release already in progress; its deadline is unchanged."};
-        }
-        if (state_ == State::Fault) {
-            if (!mode_stationary_healthy(feedback) || feedback.drive_mode != 0) {
-                return {false, "Fault reset requires fresh, nonblocked, stopped Neutral feedback in remote mode."};
-            }
-            clear_commands();
-            state_ = State::Monitoring;
-            reason_ = "Mode-only fault reset explicitly; a new enable request is required.";
-            intent_ = TxIntent{};
-            return {true, reason_};
-        }
-        begin_mode_release(now, "Explicit mode release requested.", false);
-        return {true, reason_};
-    }
-
-    if (!config_.tx_enabled) {
-        return {false, "Transmission is disabled by configuration."};
-    }
-    if (state_ != State::Monitoring) {
-        return {false, "Enable requires MONITORING; disable/reset the current session first."};
-    }
-    if (!mode_stationary_healthy(feedback)) {
-        return {false, "Mode request requires fresh, nonblocked feedback, Neutral gear, and a stopped vehicle."};
-    }
-    if (!feedback.remote_fresh || !feedback.remote_selected) {
-        return {false, "Mode request requires fresh 0x10A feedback with the A switch selected."};
-    }
-    if (feedback.drive_mode != 0) {
-        return {false, "Mode request must start in remote mode (drive_mode=0)."};
-    }
-    if (session_id_ == std::numeric_limits<std::uint64_t>::max()) {
-        fail("Session identifier exhausted; restart the node.");
-        return {false, reason_};
-    }
-    clear_commands();
-    ++session_id_;
-    mode_request_sent_ = false;
-    mode_release_sent_ = false;
-    mode_release_fault_ = false;
-    state_ = State::Requesting;
-    phase_started_ = now;
-    phase_sequence_ = feedback.status_303_sequence;
-    reason_ = "Sending only 0x501; waiting for post-send AD mode feedback.";
-    build_mode_intent();
-    return {true, reason_};
-}
-
 void ControlManager::on_control_request_sent(
     bool request, const Feedback& feedback, TimePoint now)
 {
-    if (config_.policy == Policy::RemoteMode) {
+    if (config_.policy == Policy::HardwareDrive) {
         if (state_ == State::Disconnected || !config_.tx_enabled) {
             return;
         }
-        if (request && remote_request_enabled_ && state_ != State::Stopping) {
-            remote_tx_failed_ = false;
+        if (request && hardware_request_enabled_ && state_ != State::Stopping) {
+            hardware_request_tx_failed_ = false;
             state_ = State::Monitoring;
             reason_ = "Continuous 0x501 request=1; vehicle feedback is observation only, without an AD ownership claim.";
         } else if (!request && state_ == State::Stopping && now >= phase_started_) {
-            remote_tx_failed_ = false;
-            if (!mode_release_sent_) {
-                mode_release_sent_ = true;
+            hardware_request_tx_failed_ = false;
+            if (!hardware_release_sent_) {
+                hardware_release_sent_ = true;
                 phase_sequence_ = feedback.status_303_sequence;
             }
             reason_ = "Sending request=0 until the configured release deadline.";
         }
-        build_remote_intent();
+        build_hardware_request_intent();
         return;
-    }
-    if (config_.policy != Policy::ModeOnly || now < phase_started_) {
-        return;
-    }
-    if (request && state_ == State::Requesting && !mode_request_sent_) {
-        mode_request_sent_ = true;
-        phase_sequence_ = feedback.status_303_sequence;
-    } else if (!request && state_ == State::Stopping && !mode_release_sent_) {
-        mode_release_sent_ = true;
-        phase_sequence_ = feedback.status_303_sequence;
     }
 }
 
-void ControlManager::mark_mode_release_fault(const std::string& reason)
-{
-    if (!mode_release_fault_) {
-        reason_ = reason + " Sending only request=0 until the mode release deadline.";
-    }
-    mode_release_fault_ = true;
-}
-
-void ControlManager::begin_mode_release(TimePoint now, const std::string& reason, bool fault)
-{
-    if (state_ == State::Stopping) {
-        if (fault) {
-            mark_mode_release_fault(reason);
-        }
-        build_mode_intent();
-        return;
-    }
-    clear_commands();
-    state_ = State::Stopping;
-    phase_started_ = now;
-    mode_release_sent_ = false;
-    mode_release_fault_ = false;
-    reason_ = reason + " Sending only request=0 until the mode release deadline.";
-    if (fault) {
-        mark_mode_release_fault(reason);
-    }
-    build_mode_intent();
-}
-
-void ControlManager::tick_mode(const Feedback& feedback, TimePoint now)
-{
-    if (state_ == State::Monitoring || state_ == State::Fault || state_ == State::Disconnected) {
-        intent_ = TxIntent{};
-        return;
-    }
-
-    if (state_ == State::Stopping) {
-        // A-switch selection is unnecessary for releasing the mode. Keep trying
-        // request=0 on stale/faulted feedback, but never report a clean completion.
-        if (!mode_stationary_healthy(feedback)) {
-            mark_mode_release_fault("Feedback became stale, blocked, moving, or non-Neutral during mode release.");
-        }
-        if (now - phase_started_ >= config_.release_timeout) {
-            const bool acknowledged = mode_release_sent_ && feedback.all_fresh &&
-                feedback.drive_mode == 0 && feedback.status_303_sequence > phase_sequence_;
-            if (!acknowledged) {
-                fail(reason_ + " Remote mode was not confirmed after a successful request=0 write.");
-            } else if (mode_release_fault_) {
-                fail(reason_ + " Remote mode was confirmed; explicit fault reset is required.");
-            } else {
-                state_ = State::Monitoring;
-                reason_ = "Remote mode confirmed after request=0; a new enable request is required.";
-                intent_ = TxIntent{};
-            }
-            return;
-        }
-        build_mode_intent();
-        return;
-    }
-
-    if (!mode_stationary_healthy(feedback)) {
-        begin_mode_release(now, "Mode-only feedback is stale, blocked, moving, or non-Neutral.", true);
-        return;
-    }
-    if (!feedback.remote_fresh || !feedback.remote_selected) {
-        begin_mode_release(now, "A-switch feedback is stale or the A switch is no longer selected.", true);
-        return;
-    }
-    if (state_ == State::Requesting) {
-        if (now - phase_started_ >= config_.request_timeout) {
-            begin_mode_release(now, "AD mode acknowledgement timed out.", true);
-            return;
-        }
-        if (feedback.drive_mode != 0 && feedback.drive_mode != 1) {
-            begin_mode_release(now, "Vehicle entered an unexpected mode during the request.", true);
-            return;
-        }
-        if (mode_request_sent_ && feedback.drive_mode == 1 &&
-            feedback.status_303_sequence > phase_sequence_)
-        {
-            state_ = State::Active;
-            reason_ = "AD mode confirmed; sending only 0x501, with drive and body commands disabled.";
-        }
-    } else if (state_ == State::Active && feedback.drive_mode != 1) {
-        begin_mode_release(now, "AD mode feedback was lost.", true);
-        return;
-    }
-    // This profile deliberately has no DriveCommand timeout: it never accepts
-    // such commands and holds the mode request until disable or a monitored loss.
-    build_mode_intent();
-}
-
-void ControlManager::build_mode_intent()
-{
-    intent_ = TxIntent{};
-    if (config_.tx_enabled &&
-        (state_ == State::Requesting || state_ == State::Active || state_ == State::Stopping))
-    {
-        intent_.transmit = true;
-        intent_.request.request_control = state_ != State::Stopping;
-    }
-}
-
-ControlManager::Result ControlManager::set_remote_enabled(
+ControlManager::Result ControlManager::set_hardware_request_enabled(
     bool enable, const Feedback& feedback, TimePoint now)
 {
     if (state_ == State::Disconnected) {
@@ -646,57 +449,57 @@ ControlManager::Result ControlManager::set_remote_enabled(
         if (state_ == State::Stopping) {
             return {false, "Wait for the current mode release deadline before enabling."};
         }
-        remote_request_enabled_ = true;
-        tick_remote(feedback, now);
+        hardware_request_enabled_ = true;
+        tick_hardware_request(feedback, now);
         return {true, "Continuous 0x501 request=1 enabled; A and vehicle feedback are observation only."};
     }
     if (state_ == State::Stopping) {
         return {true, "Mode release already in progress; its deadline is unchanged."};
     }
-    if (!remote_request_enabled_ || !config_.tx_enabled) {
-        remote_request_enabled_ = false;
-        build_remote_intent();
+    if (!hardware_request_enabled_ || !config_.tx_enabled) {
+        hardware_request_enabled_ = false;
+        build_hardware_request_intent();
         return {true, "Continuous mode requests are already disabled."};
     }
-    remote_request_enabled_ = false;
+    hardware_request_enabled_ = false;
     clear_commands();
     state_ = State::Stopping;
     phase_started_ = now;
-    mode_release_sent_ = false;
-    remote_tx_failed_ = false;
+    hardware_release_sent_ = false;
+    hardware_request_tx_failed_ = false;
     reason_ = "Sending request=0 until the configured release deadline.";
-    build_remote_intent();
+    build_hardware_request_intent();
     return {true, reason_};
 }
 
-void ControlManager::tick_remote(const Feedback& feedback, TimePoint now)
+void ControlManager::tick_hardware_request(const Feedback& feedback, TimePoint now)
 {
     if (!config_.tx_enabled || state_ == State::Disconnected) {
-        build_remote_intent();
+        build_hardware_request_intent();
         return;
     }
     if (state_ == State::Stopping) {
         if (now - phase_started_ >= config_.release_timeout) {
             // This feedback is only a release result, never a prerequisite for
             // broadcasting request=1. No ownership or braking is inferred.
-            const bool acknowledged = mode_release_sent_ && feedback.all_fresh &&
+            const bool acknowledged = hardware_release_sent_ && feedback.all_fresh &&
                 feedback.drive_mode == 0 && feedback.status_303_sequence > phase_sequence_;
             state_ = acknowledged ? State::Monitoring : State::Fault;
             reason_ = acknowledged ?
                 "0x501 transmission stopped after the release interval; fresh remote mode was observed." :
                 "0x501 transmission stopped after the release interval; remote mode was not confirmed after a successful request=0 write.";
         }
-        build_remote_intent();
+        build_hardware_request_intent();
         return;
     }
-    if (remote_request_enabled_ && !remote_tx_failed_) {
+    if (hardware_request_enabled_ && !hardware_request_tx_failed_) {
         state_ = State::Monitoring;
         reason_ = "Continuous 0x501 request=1; vehicle feedback is observation only, without an AD ownership claim.";
     }
-    build_remote_intent();
+    build_hardware_request_intent();
 }
 
-void ControlManager::build_remote_intent()
+void ControlManager::build_hardware_request_intent()
 {
     intent_ = TxIntent{};
     if (!config_.tx_enabled || state_ == State::Disconnected) {
@@ -705,7 +508,7 @@ void ControlManager::build_remote_intent()
     if (state_ == State::Stopping) {
         intent_.transmit = true;
         intent_.request.request_control = false;
-    } else if (remote_request_enabled_) {
+    } else if (hardware_request_enabled_) {
         intent_.transmit = true;
         intent_.request.request_control = true;
     }

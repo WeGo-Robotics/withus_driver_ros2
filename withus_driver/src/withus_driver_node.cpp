@@ -15,10 +15,8 @@ WithusDriverNode::WithusDriverNode() : rclcpp::Node("withus_driver", "withus")
     rcl_interfaces::msg::ParameterDescriptor descriptor;
     descriptor.read_only = true;
     const auto interface_name = declare_parameter<std::string>("can_interface", "can0", descriptor);
-    control_profile_ = declare_parameter<std::string>("control_profile", "monitor_only", descriptor);
-    const bool brake_test_profile = control_profile_ == "hardware_brake_test";
-    const bool remote_mode = control_profile_ == "hardware_remote_mode" || brake_test_profile;
-    mode_only_ = control_profile_ == "hardware_mode_only" || remote_mode;
+    control_profile_ = declare_parameter<std::string>("control_profile", "hardware_drive", descriptor);
+    const bool drive_profile = control_profile_ == "hardware_drive";
     base_frame_id_ = declare_parameter<std::string>("base_frame_id", "base_link", descriptor);
     if (base_frame_id_.empty()) throw std::invalid_argument("base_frame_id is empty");
     auto milliseconds = [&](const char* name, int initial) {
@@ -30,14 +28,11 @@ WithusDriverNode::WithusDriverNode() : rclcpp::Node("withus_driver", "withus")
     max_command_age_ns_ = milliseconds("max_command_age_ms", 200).count() * 1000000;
     future_tolerance_ns_ = milliseconds("future_stamp_tolerance_ms", 50).count() * 1000000;
     ControlManager::Config config;
-    config.tx_enabled = declare_parameter<bool>("enable_tx", false, descriptor);
-    if (control_profile_ != "monitor_only" && control_profile_ != "vcan_reference" && !mode_only_)
-        throw std::invalid_argument("Unknown control_profile");
-    config.policy = remote_mode ? ControlManager::Policy::RemoteMode :
-        (mode_only_ ? ControlManager::Policy::ModeOnly : ControlManager::Policy::VcanReference);
-    if (config.tx_enabled && control_profile_ == "monitor_only") {
-        throw std::invalid_argument("monitor_only does not permit TX");
-    }
+    config.tx_enabled = declare_parameter<bool>("enable_tx", true, descriptor);
+    if (!drive_profile && control_profile_ != "vcan_reference")
+        throw std::invalid_argument("control_profile must be hardware_drive or vcan_reference");
+    config.policy = drive_profile ? ControlManager::Policy::HardwareDrive :
+        ControlManager::Policy::VcanReference;
     if (config.tx_enabled && control_profile_ == "vcan_reference" && !is_vcan_interface(interface_name)) {
         throw std::invalid_argument("vcan_reference TX requires kernel interface kind vcan");
     }
@@ -58,23 +53,24 @@ WithusDriverNode::WithusDriverNode() : rclcpp::Node("withus_driver", "withus")
     std::random_device random;
     const std::uint64_t seed = (static_cast<std::uint64_t>(random()) << 32) | random();
     control_ = std::make_unique<ControlManager>(config, seed == 0 ? 1 : seed);
-    if (brake_test_profile) {
-        BrakeTestController::Config brake_config;
-        brake_config.tx_enabled = config.tx_enabled;
-        brake_config.command_timeout = config.command_timeout;
-        brake_config.max_test_duration = milliseconds("brake_test_max_duration_ms", 2000);
-        brake_config.release_duration = milliseconds("brake_test_release_duration_ms", 1000);
-        brake_config.stopped_dwell = config.stopped_dwell;
-        brake_config.stopped_threshold_mps = config.stopped_speed_mps;
-        brake_config.max_brake_percent = declare_parameter<double>("brake_test_max_percent", 100.0, descriptor);
-        if (brake_config.max_test_duration > std::chrono::milliseconds(5000) ||
-            brake_config.release_duration > std::chrono::milliseconds(5000)) {
-            throw std::invalid_argument("Brake test and invalidation intervals must be <= 5000 ms");
-        }
-        brake_test_ = std::make_unique<BrakeTestController>(brake_config, seed == 0 ? 1 : seed);
-        brake_session_id_ = brake_test_->session_id();
+    if (drive_profile) {
+        HardwareDriveController::Config drive_config;
+        drive_config.tx_enabled = config.tx_enabled;
+        drive_config.command_timeout = config.command_timeout;
+        drive_config.invalidation_duration = milliseconds("drive_invalidation_duration_ms", 1000);
+        drive_config.stopped_dwell = config.stopped_dwell;
+        drive_config.stopped_threshold_mps = config.stopped_speed_mps;
+        drive_config.max_forward_mps = config.max_forward_mps;
+        drive_config.max_reverse_mps = config.max_reverse_mps;
+        drive_config.max_steering_rad = config.max_steering_rad;
+        drive_config.mode_request_timeout = config.request_timeout;
+        drive_config.gear_timeout = config.request_timeout;
+        if (drive_config.invalidation_duration > std::chrono::milliseconds(5000))
+            throw std::invalid_argument("drive_invalidation_duration_ms must be <= 5000");
+        hardware_drive_ = std::make_unique<HardwareDriveController>(drive_config, seed == 0 ? 1 : seed);
+        drive_session_id_ = hardware_drive_->session_id();
         shutdown_timeout_ = std::max(shutdown_timeout_,
-            brake_config.release_duration + std::chrono::milliseconds(500));
+            drive_config.invalidation_duration + std::chrono::milliseconds(500));
         active_ros_ns_ = now().nanoseconds();
     }
     if (!transport_.open(interface_name)) throw std::runtime_error("Failed to open " + interface_name);
@@ -88,11 +84,6 @@ WithusDriverNode::WithusDriverNode() : rclcpp::Node("withus_driver", "withus")
         [this](withus_msgs::msg::DriveCommand::ConstSharedPtr msg) { on_drive(*msg); });
     body_subscription_ = create_subscription<withus_msgs::msg::BodyCommand>("body_command", rclcpp::QoS(1),
         [this](withus_msgs::msg::BodyCommand::ConstSharedPtr msg) { on_body(*msg); });
-    if (brake_test_) {
-        brake_test_subscription_ = create_subscription<withus_msgs::msg::BrakeTestCommand>(
-            "brake_test_command", rclcpp::QoS(1),
-            [this](withus_msgs::msg::BrakeTestCommand::ConstSharedPtr msg) { on_brake_test(*msg); });
-    }
     control_service_ = create_service<withus_msgs::srv::SetControl>("set_control",
         [this](const std::shared_ptr<withus_msgs::srv::SetControl::Request> req,
                std::shared_ptr<withus_msgs::srv::SetControl::Response> res) {
@@ -107,11 +98,11 @@ WithusDriverNode::WithusDriverNode() : rclcpp::Node("withus_driver", "withus")
             } else {
                 const auto result = control_->set_enabled(req->enable, fb, ControlManager::Clock::now());
                 res->accepted = result.accepted; res->message = result.reason;
-                if (result.accepted && brake_test_) {
-                    brake_test_->set_allowed(req->enable, fb, ControlManager::Clock::now());
+                if (result.accepted && hardware_drive_) {
+                    hardware_drive_->set_allowed(req->enable, fb, ControlManager::Clock::now());
                 }
             }
-            res->session_id = brake_test_ ? brake_test_->session_id() : control_->session_id();
+            res->session_id = hardware_drive_ ? hardware_drive_->session_id() : control_->session_id();
         });
     status_timer_ = create_wall_timer(std::chrono::milliseconds(20), [this]() {
         publish_vehicle_status(); publish_driver_status();
@@ -168,18 +159,30 @@ void WithusDriverNode::update_control(const ControlManager::Feedback& feedback)
     const auto ros_ns = now().nanoseconds();
     if (!can_connected_.load()) {
         control_->on_disconnect();
-        if (brake_test_) brake_test_->on_disconnect();
+        if (hardware_drive_) hardware_drive_->on_disconnect();
     } else if (last_ros_ns_ > 0 && ros_ns < last_ros_ns_ && control_->intent().transmit) {
         control_->on_tx_failure("ROS clock moved backwards");
-        if (brake_test_) brake_test_->on_tx_failure("ROS clock moved backwards", ControlManager::Clock::now());
+        if (hardware_drive_) hardware_drive_->on_tx_failure("ROS clock moved backwards", ControlManager::Clock::now());
     } else {
         control_->tick(feedback, ControlManager::Clock::now());
-        if (brake_test_) brake_test_->tick(feedback, ControlManager::Clock::now());
+        if (hardware_drive_) hardware_drive_->tick(feedback, ControlManager::Clock::now());
     }
-    if (brake_test_ && brake_test_->session_id() != brake_session_id_) {
-        brake_session_id_ = brake_test_->session_id();
+    if (hardware_drive_ && hardware_drive_->session_id() != drive_session_id_) {
+        drive_session_id_ = hardware_drive_->session_id();
         active_ros_ns_ = ros_ns;
-        last_brake_test_stamp_ = 0;
+        last_drive_stamp_ = 0;
+    }
+    if (hardware_drive_) {
+        const bool confirmed = hardware_drive_->mode_confirmed();
+        const bool gear_pending = hardware_drive_->gear_pending();
+        if ((confirmed && !drive_mode_confirmed_) ||
+            (!gear_pending && drive_gear_pending_ && hardware_drive_->active())) {
+            // Do not accept a queued pre-confirmation command as the new speed
+            // request after mode/gear acknowledgement. Keep duplicate detection.
+            active_ros_ns_ = ros_ns;
+        }
+        drive_mode_confirmed_ = confirmed;
+        drive_gear_pending_ = gear_pending;
     }
     last_ros_ns_ = ros_ns;
     if (control_->state() != previous) {
@@ -217,13 +220,17 @@ void WithusDriverNode::on_drive(const withus_msgs::msg::DriveCommand& msg)
 {
     const auto feedback = feedback_snapshot();
     update_control(feedback);
-    if (mode_only_) { reject(control_profile_ + " does not accept DriveCommand"); return; }
+    if (hardware_drive_ && (!control_->intent().transmit || !control_->intent().request.request_control)) {
+        reject("Hardware drive commands are paused"); return;
+    }
     if (!valid_header(msg.header, last_drive_stamp_)) return;
     ControlManager::DriveTarget target;
     target.session_id = msg.session_id; target.gear = static_cast<Gear>(msg.gear);
     target.speed_mps = msg.speed_mps; target.steering_angle_rad = msg.steering_angle_rad;
     target.brake_percent = msg.brake_percent;
-    const auto result = control_->accept_drive(target, feedback, ControlManager::Clock::now());
+    const auto result = hardware_drive_ ?
+        hardware_drive_->accept(target, feedback, ControlManager::Clock::now()) :
+        control_->accept_drive(target, feedback, ControlManager::Clock::now());
     if (!result.accepted) reject(result.reason);
     else last_drive_stamp_ = rclcpp::Time(msg.header.stamp).nanoseconds();
 }
@@ -231,7 +238,7 @@ void WithusDriverNode::on_drive(const withus_msgs::msg::DriveCommand& msg)
 void WithusDriverNode::on_body(const withus_msgs::msg::BodyCommand& msg)
 {
     update_control(feedback_snapshot());
-    if (mode_only_) { reject(control_profile_ + " does not accept BodyCommand"); return; }
+    if (hardware_drive_) { reject(control_profile_ + " does not accept BodyCommand"); return; }
     if (!valid_header(msg.header, last_body_stamp_)) return;
     BodyCommand body;
     body.headlight_on = msg.headlight_on; body.left_indicator_on = msg.left_indicator_on;
@@ -241,34 +248,19 @@ void WithusDriverNode::on_body(const withus_msgs::msg::BodyCommand& msg)
     else last_body_stamp_ = rclcpp::Time(msg.header.stamp).nanoseconds();
 }
 
-void WithusDriverNode::on_brake_test(const withus_msgs::msg::BrakeTestCommand& msg)
-{
-    const auto feedback = feedback_snapshot();
-    update_control(feedback);
-    if (!brake_test_ || !control_->intent().transmit ||
-        !control_->intent().request.request_control) {
-        reject("Stationary brake testing is not enabled"); return;
-    }
-    if (!valid_header(msg.header, last_brake_test_stamp_)) return;
-    const auto result = brake_test_->accept(
-        msg.brake_percent, msg.session_id, feedback, ControlManager::Clock::now());
-    if (!result.accepted) reject(result.reason);
-    else last_brake_test_stamp_ = rclcpp::Time(msg.header.stamp).nanoseconds();
-}
-
 void WithusDriverNode::transmit(bool body_only)
 {
     update_control(feedback_snapshot());
     const auto intent = control_->intent();
     if (!can_connected_.load()) return;
     if (!intent.transmit) {
-        if (!body_only) transmit_brake_test();
+        if (!body_only) transmit_hardware_drive();
         return;
     }
     // Enforce the profile at the egress boundary as well as in ControlManager.
-    if (mode_only_ && body_only) return;
+    if (hardware_drive_ && body_only) return;
     std::array<CanFrame, 5> frames{};
-    if (mode_only_) {
+    if (hardware_drive_) {
         if (!encode_control_request(intent.request, counters_[0], frames[0])) {
             control_->on_tx_failure("Control request encoding failed"); return;
         }
@@ -283,15 +275,15 @@ void WithusDriverNode::transmit(bool body_only)
         control_->on_tx_failure("Drive encoding failed"); return;
     }
     const std::size_t begin = body_only ? 4 : 0;
-    const std::size_t end = mode_only_ ? 1 : (body_only ? 5 : 4);
+    const std::size_t end = hardware_drive_ ? 1 : (body_only ? 5 : 4);
     for (auto i = begin; i < end; ++i) {
         const auto result = transport_.send(frames[i]);
         if (result != SendResult::Sent) {
             ++tx_failed_frames_;
             control_->on_tx_failure(result == SendResult::WouldBlock ? "CAN TX queue unavailable" : "CAN TX failed");
-            if (brake_test_) {
-                brake_test_->on_tx_failure("Mode request transmission failed", ControlManager::Clock::now());
-                transmit_brake_test();
+            if (hardware_drive_) {
+                hardware_drive_->on_tx_failure("Mode request transmission failed", ControlManager::Clock::now());
+                transmit_hardware_drive();
             }
             return;
         }
@@ -302,30 +294,48 @@ void WithusDriverNode::transmit(bool body_only)
                 feedback_snapshot(), ControlManager::Clock::now());
         }
     }
-    if (!body_only) transmit_brake_test();
+    if (!body_only) transmit_hardware_drive();
 }
 
-void WithusDriverNode::transmit_brake_test()
+void WithusDriverNode::transmit_hardware_drive()
 {
-    if (!brake_test_ || !can_connected_.load()) return;
-    brake_test_->tick(feedback_snapshot(), ControlManager::Clock::now());
-    const auto intent = brake_test_->intent();
+    if (!hardware_drive_ || !can_connected_.load()) return;
+    hardware_drive_->tick(feedback_snapshot(), ControlManager::Clock::now());
+    const auto intent = hardware_drive_->intent();
     if (!intent.transmit) return;
-    CanFrame frame{};
-    // The only extra egress in this profile is 0x503. No steering or gear/speed frame.
-    if (!encode_brake_command(intent.command, counters_[2], frame)) {
-        brake_test_->on_tx_failure("Brake test encoding failed", ControlManager::Clock::now());
+    std::array<CanFrame, 3> frames{};
+    if (!encode_steering_command(intent.steering, counters_[1], frames[0]) ||
+        !encode_brake_command(intent.brake, counters_[2], frames[1]) ||
+        !encode_speed_command(intent.speed, counters_[3], frames[2])) {
+        hardware_drive_->on_tx_failure("Drive encoding failed", ControlManager::Clock::now());
         return;
     }
-    const auto result = transport_.send(frame);
-    if (result != SendResult::Sent) {
-        ++tx_failed_frames_;
-        brake_test_->on_tx_failure(result == SendResult::WouldBlock ?
-            "Brake TX queue unavailable" : "Brake TX failed", ControlManager::Clock::now());
-        return;
+    const bool valid_batch = intent.steering.valid && intent.brake.valid && intent.speed.valid;
+    bool complete = true;
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        // Recheck feedback between writes; never finish a cached valid batch
+        // after A/feedback loss has invalidated its session.
+        if (valid_batch) {
+            hardware_drive_->tick(feedback_snapshot(), ControlManager::Clock::now());
+            if (!hardware_drive_->active()) return;
+        }
+        const auto result = transport_.send(frames[i]);
+        if (result != SendResult::Sent) {
+            ++tx_failed_frames_;
+            complete = false;
+            hardware_drive_->on_tx_failure(result == SendResult::WouldBlock ?
+                "Drive TX queue unavailable" : "Drive TX failed", ControlManager::Clock::now());
+            // A partially written valid batch must not proceed to acceleration.
+            // For an invalid batch still attempt the remaining invalid frames.
+            if (valid_batch) return;
+            continue;
+        }
+        ++tx_sent_frames_;
+        counters_[i + 1] = static_cast<std::uint8_t>((counters_[i + 1] + 1U) & 0x0FU);
     }
-    ++tx_sent_frames_;
-    counters_[2] = static_cast<std::uint8_t>((counters_[2] + 1U) & 0x0FU);
+    if (complete && valid_batch) {
+        hardware_drive_->on_commands_sent(feedback_snapshot(), ControlManager::Clock::now());
+    }
 }
 
 void WithusDriverNode::publish_driver_status()
@@ -337,18 +347,19 @@ void WithusDriverNode::publish_driver_status()
     msg.state = static_cast<std::uint8_t>(control_->state()); msg.reason = control_->reason();
     msg.last_rejection = last_rejection_;
     msg.can_connected = can_connected_.load(); msg.enable_tx = control_->tx_enabled();
-    msg.feedback_valid = feedback.all_fresh && (!mode_only_ || feedback.remote_fresh);
-    msg.session_id = brake_test_ ? brake_test_->session_id() : control_->session_id();
+    msg.feedback_valid = feedback.all_fresh && (!hardware_drive_ || feedback.remote_fresh);
+    msg.session_id = hardware_drive_ ? hardware_drive_->session_id() : control_->session_id();
     msg.control_profile = control_profile_;
     msg.control_requested = control_->intent().transmit && control_->intent().request.request_control;
-    msg.command_age_sec = control_->command_age_sec(ControlManager::Clock::now());
+    msg.command_age_sec = hardware_drive_ ? hardware_drive_->command_age_sec(ControlManager::Clock::now()) :
+        control_->command_age_sec(ControlManager::Clock::now());
     msg.rejected_commands = rejected_commands_; msg.tx_sent_frames = tx_sent_frames_;
     msg.tx_failed_frames = tx_failed_frames_;
-    msg.brake_test_ready = brake_test_ && brake_test_->ready();
-    msg.brake_test_active = brake_test_ && brake_test_->active();
-    msg.brake_test_reason = brake_test_ ? brake_test_->reason() : "";
-    msg.brake_test_command_age_sec = brake_test_ ?
-        brake_test_->command_age_sec(ControlManager::Clock::now()) : std::numeric_limits<double>::quiet_NaN();
+    msg.drive_ready = hardware_drive_ && hardware_drive_->ready();
+    msg.drive_active = hardware_drive_ && hardware_drive_->active();
+    msg.drive_mode_confirmed = hardware_drive_ && hardware_drive_->mode_confirmed();
+    msg.drive_gear_pending = hardware_drive_ && hardware_drive_->gear_pending();
+    msg.drive_reason = hardware_drive_ ? hardware_drive_->reason() : "";
     driver_publisher_->publish(msg);
 }
 
@@ -374,7 +385,7 @@ void WithusDriverNode::publish_auxiliary()
     diagnostic_msgs::msg::DiagnosticStatus status;
     status.name = get_fully_qualified_name(); status.hardware_id = "withus_socketcan";
     const auto feedback = feedback_snapshot();
-    const bool feedback_valid = feedback.all_fresh && (!mode_only_ || feedback.remote_fresh);
+    const bool feedback_valid = feedback.all_fresh && (!hardware_drive_ || feedback.remote_fresh);
     status.level = (feedback.blocked || control_->state() == ControlManager::State::Fault ||
         !can_connected_.load()) ? diagnostic_msgs::msg::DiagnosticStatus::ERROR :
         (feedback_valid ? diagnostic_msgs::msg::DiagnosticStatus::OK : diagnostic_msgs::msg::DiagnosticStatus::WARN);
@@ -382,10 +393,12 @@ void WithusDriverNode::publish_auxiliary()
     diagnostic_msgs::msg::KeyValue value;
     value.key = "feedback_valid"; value.value = feedback_valid ? "true" : "false";
     status.values.push_back(value);
-    if (brake_test_) {
-        value.key = "brake_test_ready"; value.value = brake_test_->ready() ? "true" : "false";
+    if (hardware_drive_) {
+        value.key = "drive_ready"; value.value = hardware_drive_->ready() ? "true" : "false";
         status.values.push_back(value);
-        value.key = "brake_test_reason"; value.value = brake_test_->reason();
+        value.key = "drive_mode_confirmed"; value.value = hardware_drive_->mode_confirmed() ? "true" : "false";
+        status.values.push_back(value);
+        value.key = "drive_reason"; value.value = hardware_drive_->reason();
         status.values.push_back(value);
     }
     array.status.push_back(status);
@@ -396,14 +409,14 @@ void WithusDriverNode::request_shutdown()
 {
     shutting_down_ = true;
     const auto feedback = feedback_snapshot(); update_control(feedback);
-    if (brake_test_) brake_test_->set_allowed(false, feedback, ControlManager::Clock::now());
+    if (hardware_drive_) hardware_drive_->set_allowed(false, feedback, ControlManager::Clock::now());
     const auto result = control_->set_enabled(false, feedback, ControlManager::Clock::now());
     RCLCPP_INFO(get_logger(), "Shutdown: %s", result.reason.c_str());
 }
 
 bool WithusDriverNode::ready_to_shutdown() const
 {
-    return (!brake_test_ || (!brake_test_->active() && !brake_test_->releasing())) &&
+    return (!hardware_drive_ || (!hardware_drive_->active() && !hardware_drive_->invalidating())) &&
         (control_->state() == ControlManager::State::Monitoring ||
         control_->state() == ControlManager::State::Fault ||
         control_->state() == ControlManager::State::Disconnected);

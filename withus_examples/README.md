@@ -1,69 +1,108 @@
 # Withus Python 예제
 
-`withus_examples`는 공개 ROS 인터페이스를 사용하는 Python 예제 패키지입니다. `status_monitor`는 차량 상태 요약과 수신 중단 감시를 제공하고, `brake_response_check`는 명시적으로 요청한 정지 상태 제동 시험과 압력 관측을 수행합니다.
+`withus_examples`는 드라이버의 공개 ROS 인터페이스를 사용하는 client 패키지입니다. 드라이버와 client를 각각 다른 터미널에서 실행합니다. 각 예제 launch는 해당 client 하나만 시작하며, 드라이버 실행·CAN 설정·제어 서비스 호출을 수행하지 않습니다.
+
+| 예제 launch | 기능 |
+| --- | --- |
+| `status_monitor.launch.py` | 상태 요약과 수신 중단 감시 |
+| `brake_response_check.launch.py` | 정지·중립 상태에서 명시한 제동 명령의 압력 응답 관측 |
 
 ## 빌드
 
-워크스페이스 루트에서 메시지 패키지와 예제를 빌드합니다.
+워크스페이스 루트에서 드라이버와 예제를 함께 빌드합니다.
 
 ```bash
 cd ~/ros2_workspace/withus_ws
 source /opt/ros/humble/setup.bash
-colcon build --packages-up-to withus_examples
+colcon build --packages-up-to withus_bringup withus_examples
 source install/setup.bash
 ```
 
-실차에서 사용하려면 별도로 빌드한 `withus_bringup`과 준비된 CAN 인터페이스가 필요합니다. 예제 자체는 `rclpy`, `rcl_interfaces`, `withus_msgs`를 사용하며 CAN 소켓을 열지 않습니다.
+## 드라이버 실행: 터미널 1
 
-## 실행
-
-드라이버를 실행한 터미널:
+CAN 인터페이스를 준비한 뒤 기본 launch를 실행합니다. 기본 프로필은 `hardware_drive`이며 CAN 송신이 활성화됩니다.
 
 ```bash
+source install/setup.bash
 ros2 launch withus_bringup withus_bringup.launch.py can_interface:=can0
 ```
 
-다른 터미널에서 예제를 실행합니다.
+드라이버는 `0x501 request=1`을 계속 보내며 조종기 A로 모드를 선택합니다. client의 유효한 `DriveCommand`가 없으면 구동 명령 `0x502/503/504`를 시작하지 않습니다.
 
-```bash
-cd ~/ros2_workspace/withus_ws
-source install/setup.bash
-ros2 run withus_examples status_monitor
-```
-
-예제 노드는 `/withus/status_monitor`, 구독 토픽은 `/withus/vehicle_status`입니다. 예제는 차량 명령을 보내지 않으며, Ctrl+C로 종료해도 드라이버는 계속 실행됩니다.
-
-## 정지 상태 제동 응답 예제
-
-차량을 정지·중립(N)으로 유지하고 기존 드라이버를 종료한 뒤 실행합니다. 시험 중 제동력이 달라질 수 있으므로 차량이 굴러가지 않게 유지하세요.
-
-```bash
-ros2 launch withus_bringup withus_brake_test.launch.py
-```
-
-A를 선택하고 다른 터미널에서 요청 비율과 시간을 지정합니다.
+## 상태 모니터: 터미널 2
 
 ```bash
 source install/setup.bash
-ros2 run withus_examples brake_response_check --brake-percent 10 --duration 1.0
+ros2 launch withus_examples status_monitor.launch.py
 ```
 
-`10`은 명령 사용 예시이며 검증된 정지 비율이 아닙니다. `--brake-percent`는 필수(0~100), `--duration`은 기본 1초이며 0 초과 1.5초 이하입니다. `--namespace` 기본값은 `/withus`입니다.
+예제 노드는 `/withus/status_monitor`, 구독 토픽은 `/withus/vehicle_status`입니다. 상태 모니터는 차량 명령을 보내지 않습니다. Ctrl+C로 client를 종료해도 터미널 1의 드라이버는 계속 실행됩니다.
 
-예제는 준비 상태를 최대 5초 기다린 뒤 `/withus/brake_test_command`에 현재 세션·시각·제동 비율을 20ms마다 발행합니다. 드라이버 프로필이 다르거나 준비되지 않으면 시험을 시작하지 않습니다. 시험 중 세션 변경·상태 수신 중단·조건 상실을 확인하면 명령 발행을 멈추며 새 세션으로 자동 재시작하지 않습니다.
+설정을 바꾸려면 launch 인자를 사용합니다.
 
-출력의 압력(Pa), 실제 속도, 차량 모드를 명령 전·중·후에 비교하세요. 이 예제는 정지 성능을 판정하거나 정지 제동량을 자동 산출하지 않습니다. 정상 완료나 Ctrl+C로 예제를 종료하면 명령 발행이 중단되고, 드라이버는 명령 만료 후 제한된 `0x503 valid=0` 송신을 수행합니다. 이는 물리적인 제동 해제 완료의 확인과 별개입니다.
+```bash
+ros2 launch withus_examples status_monitor.launch.py \
+  namespace:=withus \
+  report_period_sec:=2.0 \
+  status_topic_timeout_sec:=1.0
+```
 
-CAN 소켓과 `/set_control` 서비스는 예제가 사용하지 않습니다. 전체 프로필·상태·timeout 설정은 [드라이버 매뉴얼](../README.md#정지-상태에서-제동-응답-확인하기)을 참고하세요.
-
-## 상태 모니터 설정
-
-다른 토픽으로 연결할 때는 상대 이름 `vehicle_status`를 remap합니다.
+다른 토픽으로 연결할 때는 직접 실행하여 상대 이름 `vehicle_status`를 remap할 수도 있습니다.
 
 ```bash
 ros2 run withus_examples status_monitor --ros-args \
   -r vehicle_status:=/another_robot/vehicle_status
 ```
+
+## 정지 상태 제동 응답: 터미널 2
+
+터미널 1의 동일한 `withus_bringup.launch.py`를 사용합니다. 차량을 정지·중립(N)으로 유지하고 A를 선택한 뒤, 요청 비율과 시간을 명시합니다. 시험 중 제동력이 달라질 수 있으므로 차량이 굴러가지 않게 유지하세요.
+
+```bash
+source install/setup.bash
+ros2 launch withus_examples brake_response_check.launch.py \
+  brake_percent:=10 duration:=1.0
+```
+
+`10`은 명령 사용 예시이며 검증된 정지 비율이 아닙니다.
+
+| launch 인자 | 기본값 | 의미 |
+| --- | --- | --- |
+| `brake_percent` | 없음, 필수 | client가 선택한 제동 비율, 유한한 0~100% |
+| `duration` | `1.0` | 명령 발행 시간, 0 초과 1.5 이하, 초 |
+| `namespace` | `withus` | 드라이버 토픽과 연결할 namespace |
+
+기존 직접 실행 방식도 지원합니다.
+
+```bash
+ros2 run withus_examples brake_response_check --brake-percent 10 --duration 1.0
+```
+
+이 예제는 `/withus/drive_command`에 **전체 `DriveCommand`**를 20ms마다 보냅니다. 제동 명령만 단독 송신하는 예제가 아닙니다.
+
+| 명령 필드 | 발행 값 |
+| --- | --- |
+| `header.stamp` | 발행 시점의 ROS 시각 |
+| `session_id` | 시작할 때 확인한 드라이버 세션 |
+| `gear` | 중립(N), `2` |
+| `speed_mps` | `0.0` m/s |
+| `steering_angle_rad` | 시작 시 관측한 실제 조향각을 계속 유지, rad |
+| `brake_percent` | 사용자가 지정한 비율, % |
+
+드라이버는 이 명령을 `0x502` 조향·`0x503` 제동·`0x504` 기어/속도로 송신합니다. 예제는 조향을 중앙으로 바꾸지 않습니다. 시작 조향각이 유한하지 않거나 절댓값이 `0.3 rad`를 넘으면 실행을 거절합니다. 이 값은 예제의 보수적인 입력 범위이며 드라이버의 `max_steering_angle_rad` 설정을 바꾸지 않습니다. 드라이버를 더 좁은 범위로 설정했다면 드라이버의 거절 사유를 출력하고 중단합니다.
+
+시작 전에 최대 5초 동안 다음 조건을 기다립니다.
+
+- `hardware_drive`, CAN 송신 활성, `control_requested=true`, `drive_ready=true`, 다른 활성 구동 명령 없음.
+- 301·303·304·10A 피드백 유효, A 선택, 차단 고장/범퍼/비상정지/병렬주행 없음.
+- 중립(N), 실제 속도 절댓값 `0.05 m/s` 이하, 모드 AD(1) 또는 semi-autonomous(3).
+- ROS 상태 토픽이 0.25초 이내에 수신되고 구독자가 연결됨.
+
+실행 중 세션 변경·상태 수신 중단·기어/속도/A/고장 조건 상실을 확인하면 발행을 끝냅니다. 새 세션으로 자동 재시작하지 않습니다. 드라이버가 적용하는 정지 유지 시간·AD 모드 확인·명령 유효기간 등의 조건도 그대로 적용됩니다. 모드 3에서 시작했더라도 드라이버의 제한 시간 안에 명령 송신 이후의 새 AD 모드 피드백이 확인되지 않으면 드라이버가 명령을 무효화합니다.
+
+종료 후 1.5초 동안 압력(Pa)과 `drive_active=false` 여부를 관측합니다. `drive_active`는 드라이버의 송신 의도이며 물리적 제동 해제를 뜻하지 않습니다. 정상 완료나 Ctrl+C로 client의 발행을 끝내면 드라이버는 명령 만료 후 제한된 시간 동안 `0x502/503/504 valid=0`을 보내고 구동 송신을 중단합니다. `0x501` 연속 송신은 유지됩니다. 이 동작은 자동 제동이나 차량 정지를 보장하지 않으며, 예제는 정지 성능을 판정하거나 정지 제동량을 산출하지 않습니다.
+
+전체 명령 처리와 파라미터는 [드라이버 매뉴얼](../README.md)을 참고하세요.
 
 ## 표시 내용
 
@@ -101,7 +140,7 @@ ROS status reception active.
 
 `age at publish`는 드라이버가 메시지에 넣은 데이터 나이입니다. ROS 전송 지연이나 예제의 출력 대기 시간을 포함한 전체 지연값이 아닙니다. 예제의 토픽 수신 감시는 별도로 로컬 `time.monotonic()`을 사용합니다.
 
-## 시작 파라미터
+## 상태 모니터 시작 파라미터
 
 | 이름 | 타입 | 기본값 | 의미 |
 | --- | --- | --- | --- |
