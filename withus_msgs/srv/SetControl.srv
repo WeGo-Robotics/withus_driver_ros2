@@ -1,0 +1,6 @@
+bool enable
+---
+# Accepted means the transition request was accepted, not completed.
+bool accepted
+uint64 session_id
+string message

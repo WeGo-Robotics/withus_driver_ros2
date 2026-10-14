@@ -1,0 +1,21 @@
+/**:
+  ros__parameters:
+    base_frame_id: base_link
+    command_timeout_ms: 200
+    body_command_timeout_ms: 500
+    control_request_timeout_ms: 1000
+    stop_timeout_ms: 3000
+    # hardware_drive uses this full request=0 release interval.
+    release_timeout_ms: 1000
+    stop_confirm_duration_ms: 200
+    max_command_age_ms: 200
+    future_stamp_tolerance_ms: 50
+    # Command limits apply to vcan_reference and hardware_drive.
+    max_forward_speed_mps: 1.0
+    max_reverse_speed_mps: 0.5
+    max_steering_angle_rad: 0.3
+    stop_brake_percent: 25.0  # vcan_reference only; hardware_drive uses client brake.
+    # Stationary threshold for starting a session and changing gear.
+    stop_speed_threshold_mps: 0.05
+    # hardware_drive: invalidate 502/503/504 after command loss; no automatic braking.
+    drive_invalidation_duration_ms: 1000
